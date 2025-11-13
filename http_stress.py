@@ -6,6 +6,7 @@ HTTP 压力测试工具
 
 import asyncio
 import json
+import sys
 import time
 from argparse import ArgumentParser, SUPPRESS
 from collections import defaultdict
@@ -356,5 +357,5 @@ def main():
 
 
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())
 

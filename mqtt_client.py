@@ -9,6 +9,7 @@ import csv
 import json
 import os
 import signal
+import sys
 import time
 from argparse import ArgumentParser
 from collections import defaultdict
@@ -483,5 +484,5 @@ def main():
 
 
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())
 
