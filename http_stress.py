@@ -7,8 +7,9 @@ HTTP 压力测试工具
 import asyncio
 import json
 import time
-from argparse import ArgumentParser
+from argparse import ArgumentParser, SUPPRESS
 from collections import defaultdict
+from datetime import datetime, timezone, timedelta
 from typing import List
 
 import aiohttp
@@ -28,6 +29,7 @@ class StressTester:
         loop_count: int = 10,
         interval: int = 0,
         timeout: int = 30,
+        emqx: bool = False,
     ):
         self.url = url
         self.csv_file = csv_file
@@ -36,6 +38,7 @@ class StressTester:
         self.loop_count = loop_count
         self.interval = interval / 1000.0  # 转换为秒
         self.timeout = timeout
+        self.emqx = emqx
         self.device_ids: List[str] = []
         self.stats = {
             "total": 0,
@@ -56,36 +59,93 @@ class StressTester:
         self, session: aiohttp.ClientSession, device_id: str
     ) -> dict:
         """发送单个 HTTP POST 请求"""
-        payload = {
-            "command": json.dumps(
-                {
-                    "cmd": "bench",
-                    "paras": {"timestamp": int(time.time() * 1000)},
-                    "serviceId": "bench",
-                }
-            ),
-            "commandType": 1,
-            "deviceId": device_id,
-            "expire": 5,
-            "qos": 1,
-        }
-
         start_time = time.time()
         try:
-            async with session.post(
-                self.url,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
-            ) as response:
-                elapsed = time.time() - start_time
-                response_text = await response.text()
-                return {
-                    "device_id": device_id,
-                    "status": response.status,
-                    "success": 200 <= response.status < 300,
-                    "elapsed": elapsed,
-                    "response": response_text[:200],  # 限制响应长度
+            if self.emqx:
+                # EMQX 格式的请求
+                # 生成 eventTime (UTC+8)
+                tz_beijing = timezone(timedelta(hours=8))
+                event_time = datetime.now(tz_beijing).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+08:00"
+                
+                # 在实际发送请求前生成 timestamp，确保时间戳更准确
+                timestamp_ns = time.time_ns()
+                
+                # 构建 payload 字符串（JSON 字符串）
+                payload_data = {
+                    "msgId": f"dn_{device_id}",
+                    "mid": int(time.time() * 1000) % 100000,
+                    "serviceId": "bench",
+                    "deviceId": device_id,
+                    "businessID": f"{device_id}_1001",
+                    "cmd": "bench",
+                    "expire": -1,
+                    "paras": {"timestamp": timestamp_ns},
+                    "eventTime": event_time,
                 }
+                
+                payload = {
+                    "payload": json.dumps(payload_data),
+                    "properties": {
+                        "message_expiry_interval": 5
+                    },
+                    "qos": 1,
+                    "topic": f"/v1/devices/{device_id}/command"
+                }
+                
+                headers = {
+                    "Authorization": "Basic YXBpOmtleQ==",
+                    "Content-Type": "application/json",
+                    "Traceparent": "00-419c5f5655c530b810eb3ad38121196b-24c1e1b6639667af-01",
+                }
+                
+                async with session.post(
+                    self.url,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout),
+                ) as response:
+                    elapsed = time.time() - start_time
+                    response_text = await response.text()
+                    return {
+                        "device_id": device_id,
+                        "status": response.status,
+                        "success": 200 <= response.status < 300,
+                        "elapsed": elapsed,
+                        "response": response_text[:200],  # 限制响应长度
+                    }
+            else:
+                # 原始格式的请求
+                # 在实际发送请求前生成 timestamp，确保时间戳更准确
+                timestamp_ns = time.time_ns()
+                
+                payload = {
+                    "command": json.dumps(
+                        {
+                            "cmd": "bench",
+                            "paras": {"timestamp": timestamp_ns},
+                            "serviceId": "bench",
+                        }
+                    ),
+                    "commandType": 1,
+                    "deviceId": device_id,
+                    "expire": 5,
+                    "qos": 1,
+                }
+                
+                async with session.post(
+                    self.url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout),
+                ) as response:
+                    elapsed = time.time() - start_time
+                    response_text = await response.text()
+                    return {
+                        "device_id": device_id,
+                        "status": response.status,
+                        "success": 200 <= response.status < 300,
+                        "elapsed": elapsed,
+                        "response": response_text[:200],  # 限制响应长度
+                    }
         except Exception as e:
             elapsed = time.time() - start_time
             return {
@@ -150,6 +210,7 @@ class StressTester:
 
         print(f"\n开始压力测试:")
         print(f"  URL: {self.url}")
+        print(f"  模式: {'EMQX' if self.emqx else '标准'}")
         print(f"  并发数: {self.concurrent}")
         print(f"  DeviceId 数量: {len(self.device_ids)}")
         print(f"  每个 DeviceId 循环次数: {self.loop_count}")
@@ -170,10 +231,11 @@ class StressTester:
                 for _ in range(self.concurrent)
             ]
 
-            # 发送请求：每个 deviceId 发送 loop_count 次
+            # 发送请求：先发送所有设备的第一条消息，然后是第二条，以此类推
+            # 这样可以确保所有设备几乎同时收到相同轮次的消息
             start_time = time.time()
-            for device_id in self.device_ids:
-                for loop_index in range(self.loop_count):
+            for loop_index in range(self.loop_count):
+                for device_id in self.device_ids:
                     await queue.put((device_id, loop_index))
 
             # 等待所有任务完成
@@ -263,6 +325,11 @@ def main():
         default=30,
         help="请求超时时间（秒）(默认: 30)",
     )
+    parser.add_argument(
+        "--emqx",
+        action="store_true",
+        help=SUPPRESS,
+    )
 
     args = parser.parse_args()
 
@@ -274,6 +341,7 @@ def main():
         loop_count=args.loop_count,
         interval=args.interval,
         timeout=args.timeout,
+        emqx=args.emqx,
     )
 
     try:
