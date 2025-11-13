@@ -5,15 +5,15 @@ HTTP 压力测试工具
 """
 
 import asyncio
-import csv
 import json
 import time
 from argparse import ArgumentParser
 from collections import defaultdict
-from pathlib import Path
 from typing import List
 
 import aiohttp
+
+from utils import load_device_ids
 
 
 class StressTester:
@@ -49,32 +49,7 @@ class StressTester:
 
     def load_device_ids(self) -> None:
         """从 CSV 文件加载 deviceId 列表"""
-        csv_path = Path(self.csv_file)
-        if not csv_path.exists():
-            raise FileNotFoundError(f"CSV 文件不存在: {self.csv_file}")
-
-        with open(csv_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            # 假设 CSV 文件有 'deviceId' 列，如果没有则尝试第一列
-            if "deviceId" in reader.fieldnames:
-                self.device_ids = [row["deviceId"] for row in reader]
-            else:
-                # 如果没有 deviceId 列，使用第一列
-                self.device_ids = [list(row.values())[0] for row in reader]
-
-        if not self.device_ids:
-            raise ValueError("CSV 文件中没有找到 deviceId")
-
-        # 检查 deviceId 数量是否足够
-        if self.device_count is not None:
-            if len(self.device_ids) < self.device_count:
-                raise ValueError(
-                    f"CSV 文件中只有 {len(self.device_ids)} 个 deviceId，"
-                    f"但需要 {self.device_count} 个"
-                )
-            # 只使用前 device_count 个
-            self.device_ids = self.device_ids[: self.device_count]
-
+        self.device_ids = load_device_ids(self.csv_file, self.device_count)
         print(f"已加载 {len(self.device_ids)} 个 deviceId")
 
     async def send_request(
@@ -314,3 +289,4 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
+
