@@ -32,6 +32,7 @@ class StressTester:
         timeout: int = 30,
         emqx: bool = False,
         edgenodeid: str = None,
+        token: str = None,
     ):
         self.url = url
         self.csv_file = csv_file
@@ -42,16 +43,19 @@ class StressTester:
         self.timeout = timeout
         self.emqx = emqx
         self.edgenodeid = edgenodeid
+        self.token = token
         self.device_ids: List[str] = []
         self.stats = {
             "total": 0,
             "success": 0,
             "failed": 0,
             "errors": [],
+            "latencies": [],  # 存储所有请求的延迟（秒）
         }
         # 用于跟踪每个 deviceId 的上次请求时间（用于间隔控制）
         self.last_request_time = defaultdict(float)
         self.interval_lock = asyncio.Lock()
+        self.stats_lock = asyncio.Lock()  # 用于保护统计数据的并发访问
 
     def load_device_ids(self) -> None:
         """从 CSV 文件加载 deviceId 列表"""
@@ -96,9 +100,8 @@ class StressTester:
                 }
                 
                 headers = {
-                    "Authorization": "Basic YXBpOmtleQ==",
+                    "Authorization": f"Basic {self.token}",
                     "Content-Type": "application/json",
-                    "Traceparent": "00-419c5f5655c530b810eb3ad38121196b-24c1e1b6639667af-01",
                 }
                 
                 async with session.post(
@@ -220,13 +223,16 @@ class StressTester:
             # 更新上次请求时间
             async with self.interval_lock:
                 self.last_request_time[device_id] = time.time()
-            self.stats["total"] += 1
-
-            if result["success"]:
-                self.stats["success"] += 1
-            else:
-                self.stats["failed"] += 1
-                self.stats["errors"].append(result)
+            
+            # 更新统计数据（需要线程安全）
+            async with self.stats_lock:
+                self.stats["total"] += 1
+                self.stats["latencies"].append(result["elapsed"])
+                if result["success"]:
+                    self.stats["success"] += 1
+                else:
+                    self.stats["failed"] += 1
+                    self.stats["errors"].append(result)
 
             queue.task_done()
 
@@ -293,6 +299,27 @@ class StressTester:
         if self.stats["total"] > 0:
             print(f"QPS: {self.stats['total'] / elapsed_time:.2f}")
             print(f"成功率: {self.stats['success'] / self.stats['total'] * 100:.2f}%")
+        
+        # 打印延迟统计信息
+        if self.stats["latencies"]:
+            latencies = sorted(self.stats["latencies"])
+            total_latencies = len(latencies)
+            avg_latency = sum(latencies) / total_latencies
+            min_latency = latencies[0]
+            max_latency = latencies[-1]
+            median_latency = latencies[total_latencies // 2]
+            p95_index = int(total_latencies * 0.95)
+            p99_index = int(total_latencies * 0.99)
+            p95_latency = latencies[p95_index] if p95_index < total_latencies else latencies[-1]
+            p99_latency = latencies[p99_index] if p99_index < total_latencies else latencies[-1]
+            
+            print(f"\n延迟统计 (请求到响应时间):")
+            print(f"  平均延迟: {avg_latency * 1000:.2f} ms")
+            print(f"  最小延迟: {min_latency * 1000:.2f} ms")
+            print(f"  最大延迟: {max_latency * 1000:.2f} ms")
+            print(f"  中位数延迟: {median_latency * 1000:.2f} ms")
+            print(f"  P95 延迟: {p95_latency * 1000:.2f} ms")
+            print(f"  P99 延迟: {p99_latency * 1000:.2f} ms")
 
         if self.stats["errors"]:
             print(f"\n前 10 个错误:")
@@ -368,12 +395,22 @@ def main():
         default=None,
         help="Edge Node ID，用于非 EMQX 模式的 HTTP Header",
     )
+    parser.add_argument(
+        "--token",
+        type=str,
+        default=None,
+        help="Token，用于 EMQX 模式的 Authorization Header (Basic {token})",
+    )
 
     args = parser.parse_args()
     
     # 非 emqx 模式下，edgenodeid 是必需的
     if not args.emqx and not args.edgenodeid:
         parser.error("--edgenodeid 参数在非 EMQX 模式下是必需的")
+    
+    # emqx 模式下，token 是必需的
+    if args.emqx and not args.token:
+        parser.error("--token 参数在 EMQX 模式下是必需的")
 
     tester = StressTester(
         url=args.url,
@@ -385,6 +422,7 @@ def main():
         timeout=args.timeout,
         emqx=args.emqx,
         edgenodeid=args.edgenodeid,
+        token=args.token,
     )
 
     try:
