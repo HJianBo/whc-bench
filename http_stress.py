@@ -31,6 +31,7 @@ class StressTester:
         interval: int = 0,
         timeout: int = 30,
         emqx: bool = False,
+        edgenodeid: str = None,
     ):
         self.url = url
         self.csv_file = csv_file
@@ -40,6 +41,7 @@ class StressTester:
         self.interval = interval / 1000.0  # 转换为秒
         self.timeout = timeout
         self.emqx = emqx
+        self.edgenodeid = edgenodeid
         self.device_ids: List[str] = []
         self.stats = {
             "total": 0,
@@ -133,9 +135,14 @@ class StressTester:
                     "qos": 1,
                 }
                 
+                headers = {}
+                if self.edgenodeid:
+                    headers["edgeNodeId"] = self.edgenodeid
+                
                 async with session.post(
                     self.url,
                     json=payload,
+                    headers=headers if headers else None,
                     timeout=aiohttp.ClientTimeout(total=self.timeout),
                 ) as response:
                     elapsed = time.time() - start_time
@@ -355,8 +362,18 @@ def main():
         action="store_true",
         help=SUPPRESS,
     )
+    parser.add_argument(
+        "--edgenodeid",
+        type=str,
+        default=None,
+        help="Edge Node ID，用于非 EMQX 模式的 HTTP Header",
+    )
 
     args = parser.parse_args()
+    
+    # 非 emqx 模式下，edgenodeid 是必需的
+    if not args.emqx and not args.edgenodeid:
+        parser.error("--edgenodeid 参数在非 EMQX 模式下是必需的")
 
     tester = StressTester(
         url=args.url,
@@ -367,6 +384,7 @@ def main():
         interval=args.interval,
         timeout=args.timeout,
         emqx=args.emqx,
+        edgenodeid=args.edgenodeid,
     )
 
     try:
