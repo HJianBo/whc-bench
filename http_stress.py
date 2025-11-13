@@ -152,16 +152,22 @@ class StressTester:
                             # 检查业务 code 是否为 0
                             if isinstance(response_json, dict) and response_json.get("code") == 0:
                                 business_success = True
-                        except (json.JSONDecodeError, AttributeError, TypeError):
+                            else:
+                                # HTTP 成功但业务 code 不为 0，打印响应内容
+                                print(f"[ERROR] Device {device_id}: HTTP {response.status} but business code is not 0. Response: {response_text[:500]}")
+                        except (json.JSONDecodeError, AttributeError, TypeError) as e:
                             # JSON 解析失败或格式不正确，认为业务失败
-                            print(f"Failed to parse JSON response for device {device_id}: {response_text[:200]}")
+                            print(f"[ERROR] Device {device_id}: Failed to parse JSON response. Error: {e}. Response: {response_text[:500]}")
+                    else:
+                        # HTTP 状态码不成功，打印响应内容
+                        print(f"[ERROR] Device {device_id}: HTTP {response.status}. Response: {response_text[:500]}")
                     
                     return {
                         "device_id": device_id,
                         "status": response.status,
                         "success": http_success and business_success,
                         "elapsed": elapsed,
-                        "response": response_text[:200],  # 限制响应长度
+                        "response": response_text[:500],  # 增加响应长度以便调试
                     }
         except Exception as e:
             elapsed = time.time() - start_time
@@ -289,6 +295,8 @@ class StressTester:
                     print(f"    错误: {error['error']}")
                 else:
                     print(f"    状态码: {error['status']}")
+                    if "response" in error:
+                        print(f"    响应内容: {error['response']}")
         print("=" * 60)
 
 

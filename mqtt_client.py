@@ -122,7 +122,7 @@ class MQTTClient:
                 hostname=self.broker_host,
                 port=self.broker_port,
                 identifier=self.device_id,
-                username=self.device_id,
+                username="admin",
                 password=self.password,
                 keepalive=self.keepalive,
             ) as client:
