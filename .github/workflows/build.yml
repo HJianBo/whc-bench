@@ -1,0 +1,70 @@
+name: Build Executables on CentOS 8
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: centos:8
+      options: --privileged
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          # CentOS 8 需要启用 vault 仓库（因为 EOL）
+          sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*.repo
+          sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo
+          
+          yum update -y
+          yum install -y \
+            curl \
+            python3 \
+            python3-pip \
+            gcc \
+            gcc-c++ \
+            make \
+            glibc-devel \
+            binutils \
+            which \
+            zlib-devel \
+            openssl-devel
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Set up Python
+        run: |
+          uv python install 3.13
+
+      - name: Install dependencies
+        run: |
+          uv sync --group dev
+
+      - name: Build http_stress
+        run: |
+          uv run pyinstaller http_stress.spec
+
+      - name: Build mqtt_client
+        run: |
+          uv run pyinstaller mqtt_client.spec
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: executables-centos8
+          path: |
+            dist/http_stress
+            dist/mqtt_client
+          retention-days: 30
+
