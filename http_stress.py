@@ -140,10 +140,26 @@ class StressTester:
                 ) as response:
                     elapsed = time.time() - start_time
                     response_text = await response.text()
+                    
+                    # 检查 HTTP 状态码
+                    http_success = 200 <= response.status < 300
+                    
+                    # 非 emqx 模式下，需要检查业务 code
+                    business_success = False
+                    if http_success:
+                        try:
+                            response_json = json.loads(response_text)
+                            # 检查业务 code 是否为 0
+                            if isinstance(response_json, dict) and response_json.get("code") == 0:
+                                business_success = True
+                        except (json.JSONDecodeError, AttributeError, TypeError):
+                            # JSON 解析失败或格式不正确，认为业务失败
+                            print(f"Failed to parse JSON response for device {device_id}: {response_text[:200]}")
+                    
                     return {
                         "device_id": device_id,
                         "status": response.status,
-                        "success": 200 <= response.status < 300,
+                        "success": http_success and business_success,
                         "elapsed": elapsed,
                         "response": response_text[:200],  # 限制响应长度
                     }
