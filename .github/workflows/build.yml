@@ -59,6 +59,10 @@ jobs:
         run: |
           uv run pyinstaller mqtt_client.spec
 
+      - name: Build kafka_consumer
+        run: |
+          uv run pyinstaller kafka_consumer.spec
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -66,5 +70,6 @@ jobs:
           path: |
             dist/http_stress
             dist/mqtt_client
+            dist/kafka_consumer
           retention-days: 30
 
