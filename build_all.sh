@@ -21,6 +21,17 @@ pyinstaller --onefile --name http_stress http_stress.py
 echo "正在打包 mqtt_client.py..."
 pyinstaller --onefile --name mqtt_client mqtt_client.py
 
+# 打包 kafka_consumer.py
+echo "正在打包 kafka_consumer.py..."
+pyinstaller --onefile --name kafka_consumer \
+    --hidden-import aiokafka \
+    --hidden-import kafka \
+    --hidden-import kafka.protocol \
+    --hidden-import kafka.client \
+    --hidden-import kafka.consumer \
+    --hidden-import kafka.producer \
+    kafka_consumer.py
+
 echo ""
 echo "打包完成！"
 echo "可执行文件位于 dist/ 目录:"
@@ -30,4 +41,5 @@ echo ""
 echo "使用方法:"
 echo "  ./dist/http_stress --url <URL> --csv devices.csv"
 echo "  ./dist/mqtt_client --broker <BROKER> --port <PORT> --csv devices.csv"
+echo "  ./dist/kafka_consumer --topic <TOPIC> --group-id <GROUP_ID>"
 
