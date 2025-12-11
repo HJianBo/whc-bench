@@ -85,7 +85,7 @@ class StressTester:
 
             # 如果提供了 productId，添加到 payload 中
             if self.productid:
-                payload["productId"] = self.productid
+                payload["deviceProductId"] = self.productid
                 payload["gatewayProductId"] = self.productid
 
             headers = {}
