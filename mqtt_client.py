@@ -8,11 +8,14 @@ import asyncio
 import csv
 import json
 import os
+import random
 import signal
 import sys
 import time
+import uuid
 from argparse import ArgumentParser
 from collections import defaultdict
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from aiomqtt import Client
@@ -32,6 +35,7 @@ class MQTTClient:
         password: str = "123456",
         keepalive: int = 60,
         latency_queue: Optional[asyncio.Queue] = None,
+        auto_reply: bool = False,
     ):
         self.broker_host = broker_host
         self.broker_port = broker_port
@@ -39,13 +43,16 @@ class MQTTClient:
         self.password = password
         self.keepalive = keepalive
         self.topic = f"/v1/devices/{device_id}/command" if device_id else None
+        self.response_topic = f"/v1/devices/{device_id}/commandResponse" if device_id else None
         self.latency_queue = latency_queue
+        self.auto_reply = auto_reply
         self.stats = {
             "messages_received": 0,
             "latencies": [],
             "errors": [],
         }
         self.running = True
+        self.client: Optional[Client] = None  # 保存client引用用于发布回复消息
 
     async def on_message(self, message) -> None:
         """处理接收到的消息"""
@@ -105,6 +112,10 @@ class MQTTClient:
                         asyncio.create_task(
                             self.manager_instance.update_global_stats(latency_ms)
                         )
+                    
+                    # 时延计算完成后，发送自动回复（如果启用）
+                    if self.auto_reply:
+                        await self._send_command_response(payload)
                 else:
                     # 不再打印每个设备的错误信息
                     self.stats["errors"].append(
@@ -115,6 +126,9 @@ class MQTTClient:
                         asyncio.create_task(
                             self.manager_instance.update_error_count()
                         )
+                    # 即使没有timestamp，也发送自动回复（如果启用）
+                    if self.auto_reply:
+                        await self._send_command_response(payload)
             else:
                 # 不再打印每个设备的错误信息
                 self.stats["errors"].append(
@@ -125,6 +139,9 @@ class MQTTClient:
                     asyncio.create_task(
                         self.manager_instance.update_error_count()
                     )
+                # 即使payload格式无效，也尝试发送自动回复（如果启用）
+                if self.auto_reply:
+                    await self._send_command_response(payload)
         except Exception as e:
             # 不再打印每个设备的错误信息
             self.stats["errors"].append({"error": str(e)})
@@ -133,6 +150,59 @@ class MQTTClient:
                 asyncio.create_task(
                     self.manager_instance.update_error_count()
                 )
+
+    async def _send_command_response(self, payload: dict) -> None:
+        """发送命令回复消息"""
+        try:
+            # 检查payload是否包含必要的字段
+            if not isinstance(payload, dict):
+                return
+            
+            # 获取请求的msgId和deviceId
+            request_msg_id = payload.get("msgId")
+            request_device_id = payload.get("deviceId")
+            
+            # 如果没有msgId或deviceId，跳过回复
+            if not request_msg_id or not request_device_id:
+                return
+            
+            # 生成回复消息
+            # 生成随机msgId（使用时间戳纳秒+随机数，生成18位数字字符串）
+            timestamp_ns = time.time_ns()
+            random_part = random.randint(1000, 9999)
+            reply_msg_id = str(timestamp_ns)[:14] + str(random_part)
+            
+            # 获取当前时间（ISO格式，+08:00时区，毫秒保留3位）
+            tz_beijing = timezone(timedelta(hours=8))
+            now = datetime.now(tz_beijing)
+            # 格式化时间，毫秒部分只保留3位
+            iso_str = now.isoformat(timespec='milliseconds')
+            # 确保时区格式为 +08:00
+            if '+' in iso_str:
+                current_time = iso_str
+            else:
+                # 如果没有时区信息，手动添加
+                current_time = iso_str + '+08:00'
+            
+            # 构建回复payload
+            response_payload = {
+                "msgId": reply_msg_id,
+                "replyId": request_msg_id,
+                "code": 200,
+                "deviceId": request_device_id,
+                "eventTime": current_time
+            }
+            
+            # 发布回复消息（QoS 0）
+            if self.client and self.response_topic:
+                await self.client.publish(
+                    self.response_topic,
+                    payload=json.dumps(response_payload),
+                    qos=0
+                )
+        except Exception as e:
+            # 回复失败不影响主流程，只记录错误
+            self.stats["errors"].append({"error": f"Failed to send response: {str(e)}"})
 
     async def connect_and_subscribe(self) -> None:
         """连接 MQTT Broker 并订阅主题"""
@@ -145,6 +215,9 @@ class MQTTClient:
                 password=self.password,
                 keepalive=self.keepalive,
             ) as client:
+                # 保存client引用以便在on_message中发布回复消息
+                self.client = client
+                
                 print(f"[{self.device_id}] 已连接到 MQTT Broker {self.broker_host}:{self.broker_port}")
                 
                 # 订阅主题
@@ -198,6 +271,7 @@ class MQTTClientManager:
         device_count: int = None,
         password: str = "123456",
         keepalive: int = 60,
+        auto_reply: bool = False,
     ):
         self.broker_host = broker_host
         self.broker_port = broker_port
@@ -205,6 +279,7 @@ class MQTTClientManager:
         self.device_count = device_count
         self.password = password
         self.keepalive = keepalive
+        self.auto_reply = auto_reply
         self.device_ids: List[str] = []
         self.clients: List[MQTTClient] = []
         self.tasks: List[asyncio.Task] = []
@@ -320,6 +395,7 @@ class MQTTClientManager:
         print(f"  Broker: {self.broker_host}:{self.broker_port}")
         print(f"  设备数量: {len(self.device_ids)}")
         print(f"  密码: {self.password}")
+        print(f"  自动回复: {'启用' if self.auto_reply else '禁用'}")
         print()
 
         # 启动 CSV 写入后台任务
@@ -334,6 +410,7 @@ class MQTTClientManager:
                 password=self.password,
                 keepalive=self.keepalive,
                 latency_queue=self.latency_queue,
+                auto_reply=self.auto_reply,
             )
             # 设置管理器引用，用于更新全局统计
             client.manager_instance = self
@@ -360,7 +437,7 @@ class MQTTClientManager:
         self.csv_writer_running = False
         if self.csv_writer_task and not self.csv_writer_task.done():
             self.csv_writer_task.cancel()
-        
+     
         # 停止所有客户端
         for client in self.clients:
             client.stop()
@@ -413,6 +490,7 @@ async def main_async(args) -> int:
         device_count=args.device_count,
         password=args.password,
         keepalive=args.keepalive,
+        auto_reply=args.auto_reply,
     )
     _manager_instance = manager
 
@@ -476,6 +554,11 @@ def main():
         type=int,
         default=60,
         help="Keepalive 时间（秒）(默认: 60)",
+    )
+    parser.add_argument(
+        "--auto-reply",
+        action="store_true",
+        help="启用自动回复功能，收到命令后自动发送回复消息 (默认: 禁用)",
     )
 
     args = parser.parse_args()
