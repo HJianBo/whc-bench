@@ -88,32 +88,51 @@ class MQTTClient:
                     
                     # 转换为带小数的毫秒显示
                     latency_ms = latency_ns / 1_000_000.0
+                    # 记录消息接收的毫秒时间戳
+                    receive_time_ms = receive_time_ns / 1_000_000.0
                     
                     # 异步将延迟数据放入队列（不阻塞消息循环）
+                    # 格式：(ClientId, TS, CommandDiff)
                     if self.latency_queue:
                         asyncio.create_task(
                             self.latency_queue.put(
-                                (self.device_id, self.stats["messages_received"], latency_ms)
+                                (self.device_id, receive_time_ms, latency_ms)
                             )
                         )
                     
-                    print(
-                        f"[{self.device_id}] 收到消息，时延: {latency_ms:.3f}ms "
-                        f"(消息数: {self.stats['messages_received']})"
-                    )
+                    # 通知管理器更新全局统计（不阻塞消息循环）
+                    if hasattr(self, 'manager_instance') and self.manager_instance:
+                        asyncio.create_task(
+                            self.manager_instance.update_global_stats(latency_ms)
+                        )
                 else:
-                    print(f"[{self.device_id}] 收到消息，但未找到 timestamp")
+                    # 不再打印每个设备的错误信息
                     self.stats["errors"].append(
                         {"error": "timestamp not found", "payload": payload_str[:200]}
                     )
+                    # 更新全局错误统计
+                    if hasattr(self, 'manager_instance') and self.manager_instance:
+                        asyncio.create_task(
+                            self.manager_instance.update_error_count()
+                        )
             else:
-                print(f"[{self.device_id}] 收到消息，但 payload 格式不正确")
+                # 不再打印每个设备的错误信息
                 self.stats["errors"].append(
                     {"error": "invalid payload format", "payload": payload_str[:200]}
                 )
+                # 更新全局错误统计
+                if hasattr(self, 'manager_instance') and self.manager_instance:
+                    asyncio.create_task(
+                        self.manager_instance.update_error_count()
+                    )
         except Exception as e:
-            print(f"[{self.device_id}] 处理消息时出错: {e}")
+            # 不再打印每个设备的错误信息
             self.stats["errors"].append({"error": str(e)})
+            # 更新全局错误统计
+            if hasattr(self, 'manager_instance') and self.manager_instance:
+                asyncio.create_task(
+                    self.manager_instance.update_error_count()
+                )
 
     async def connect_and_subscribe(self) -> None:
         """连接 MQTT Broker 并订阅主题"""
@@ -196,25 +215,51 @@ class MQTTClientManager:
         self.latency_queue: asyncio.Queue = asyncio.Queue()
         self.csv_writer_task: Optional[asyncio.Task] = None
         self.csv_writer_running = True
+        
+        # 全局统计
+        self.total_messages = 0
+        self.total_errors = 0
+        self.all_latencies: List[float] = []  # 存储毫秒单位的时延
+        self.recent_100_latencies: List[float] = []  # 最近100条消息的时延
+        self.lock = asyncio.Lock()  # 用于线程安全的统计更新
 
     def load_device_ids(self) -> None:
         """从 CSV 文件加载 deviceId 列表"""
         self.device_ids = load_device_ids(self.csv_file, self.device_count)
         print(f"已加载 {len(self.device_ids)} 个 deviceId")
 
+    async def update_global_stats(self, latency_ms: float) -> None:
+        """更新全局统计信息，每100条消息打印一次平均时延"""
+        async with self.lock:
+            self.total_messages += 1
+            self.all_latencies.append(latency_ms)
+            self.recent_100_latencies.append(latency_ms)
+            
+            # 每100条消息打印一次平均时延
+            if len(self.recent_100_latencies) >= 100:
+                avg_latency = sum(self.recent_100_latencies) / len(self.recent_100_latencies)
+                print(f"收到 {self.total_messages} 条消息，最近100条平均时延: {avg_latency:.3f}ms")
+                self.recent_100_latencies.clear()  # 清空，准备下一批100条
+    
+    async def update_error_count(self) -> None:
+        """更新全局错误统计"""
+        async with self.lock:
+            self.total_errors += 1
+    
     async def _csv_writer_worker(self) -> None:
         """CSV 写入后台任务，从队列中获取延迟数据并写入文件"""
         # 初始化 CSV 文件，写入表头
         def write_header():
             with open(self.output_csv_file, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["deviceId", "no", "latency"])
+                writer.writerow(["ClientId", "TS", "CommandDiff"])
 
         await asyncio.to_thread(write_header)
         print(f"延迟统计将输出到: {self.output_csv_file}")
 
         # 批量写入缓冲区
-        buffer: List[Tuple[str, int, float]] = []
+        # 格式：(ClientId, TS, CommandDiff)
+        buffer: List[Tuple[str, float, float]] = []
         buffer_size = 100  # 每 100 条记录写入一次
 
         def write_batch():
@@ -224,7 +269,12 @@ class MQTTClientManager:
                     self.output_csv_file, "a", newline="", encoding="utf-8"
                 ) as f:
                     writer = csv.writer(f)
-                    writer.writerows(buffer)
+                    # 格式化数据：ClientId, TS (保留3位小数), CommandDiff (保留3位小数)
+                    formatted_rows = [
+                        (client_id, f"{ts:.3f}", f"{latency:.3f}")
+                        for client_id, ts, latency in buffer
+                    ]
+                    writer.writerows(formatted_rows)
                 buffer.clear()
 
         while self.csv_writer_running:
@@ -285,6 +335,8 @@ class MQTTClientManager:
                 keepalive=self.keepalive,
                 latency_queue=self.latency_queue,
             )
+            # 设置管理器引用，用于更新全局统计
+            client.manager_instance = self
             self.clients.append(client)
             task = asyncio.create_task(client.connect_and_subscribe())
             self.tasks.append(task)
@@ -322,50 +374,27 @@ class MQTTClientManager:
         print("MQTT 客户端统计信息")
         print("=" * 80)
         
-        total_messages = 0
-        total_errors = 0
-        all_latencies = []
+        # 使用全局统计
+        print("\n总计:")
+        print(f"  总消息数: {self.total_messages}")
+        print(f"  总错误数: {self.total_errors}")
         
-        for client in self.clients:
-            stats = client.get_stats()
-            total_messages += stats["messages_received"]
-            total_errors += stats["errors_count"]
-            if "latency_avg" in stats:
-                all_latencies.extend(client.stats["latencies"])
-            
-            print(f"\n设备: {stats['device_id']}")
-            print(f"  收到消息数: {stats['messages_received']}")
-            print(f"  错误数: {stats['errors_count']}")
-            if "latency_avg" in stats:
-                # 将纳秒转换为毫秒显示
-                print(f"  平均时延: {stats['latency_avg'] / 1_000_000.0:.3f}ms")
-                print(f"  最小时延: {stats['latency_min'] / 1_000_000.0:.3f}ms")
-                print(f"  最大时延: {stats['latency_max'] / 1_000_000.0:.3f}ms")
-                print(f"  P50 时延: {stats['latency_p50'] / 1_000_000.0:.3f}ms")
-                print(f"  P95 时延: {stats['latency_p95'] / 1_000_000.0:.3f}ms")
-                print(f"  P99 时延: {stats['latency_p99'] / 1_000_000.0:.3f}ms")
-        
-        print("\n" + "-" * 80)
-        print("总计:")
-        print(f"  总消息数: {total_messages}")
-        print(f"  总错误数: {total_errors}")
-        
-        if all_latencies:
+        if self.all_latencies:
             print(f"\n全局统计:")
-            # 将纳秒转换为毫秒显示
-            avg_ns = sum(all_latencies) / len(all_latencies)
-            min_ns = min(all_latencies)
-            max_ns = max(all_latencies)
-            sorted_latencies = sorted(all_latencies)
-            p50_ns = sorted_latencies[len(sorted_latencies) // 2]
-            p95_ns = sorted_latencies[int(len(sorted_latencies) * 0.95)]
-            p99_ns = sorted_latencies[int(len(sorted_latencies) * 0.99)]
-            print(f"  平均时延: {avg_ns / 1_000_000.0:.3f}ms")
-            print(f"  最小时延: {min_ns / 1_000_000.0:.3f}ms")
-            print(f"  最大时延: {max_ns / 1_000_000.0:.3f}ms")
-            print(f"  P50 时延: {p50_ns / 1_000_000.0:.3f}ms")
-            print(f"  P95 时延: {p95_ns / 1_000_000.0:.3f}ms")
-            print(f"  P99 时延: {p99_ns / 1_000_000.0:.3f}ms")
+            # all_latencies 已经是毫秒单位
+            avg_ms = sum(self.all_latencies) / len(self.all_latencies)
+            min_ms = min(self.all_latencies)
+            max_ms = max(self.all_latencies)
+            sorted_latencies = sorted(self.all_latencies)
+            p50_ms = sorted_latencies[len(sorted_latencies) // 2]
+            p95_ms = sorted_latencies[int(len(sorted_latencies) * 0.95)]
+            p99_ms = sorted_latencies[int(len(sorted_latencies) * 0.99)]
+            print(f"  平均时延: {avg_ms:.3f}ms")
+            print(f"  最小时延: {min_ms:.3f}ms")
+            print(f"  最大时延: {max_ms:.3f}ms")
+            print(f"  P50 时延: {p50_ms:.3f}ms")
+            print(f"  P95 时延: {p95_ms:.3f}ms")
+            print(f"  P99 时延: {p99_ms:.3f}ms")
         
         print("=" * 80)
 
