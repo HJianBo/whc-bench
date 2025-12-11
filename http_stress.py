@@ -8,9 +8,8 @@ import asyncio
 import json
 import sys
 import time
-from argparse import ArgumentParser, SUPPRESS
+from argparse import ArgumentParser
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
 from typing import List
 
 import aiohttp
@@ -30,9 +29,7 @@ class StressTester:
         loop_count: int = 10,
         interval: int = 0,
         timeout: int = 30,
-        emqx: bool = False,
         edgenodeid: str = None,
-        token: str = None,
         productid: str = None,
     ):
         self.url = url
@@ -42,9 +39,7 @@ class StressTester:
         self.loop_count = loop_count
         self.interval = interval / 1000.0  # 转换为秒
         self.timeout = timeout
-        self.emqx = emqx
         self.edgenodeid = edgenodeid
-        self.token = token
         self.productid = productid
         self.device_ids: List[str] = []
         self.stats = {
@@ -70,123 +65,70 @@ class StressTester:
         """发送单个 HTTP POST 请求"""
         start_time = time.time()
         try:
-            if self.emqx:
-                # EMQX 格式的请求
-                # 生成 eventTime (UTC+8)
-                tz_beijing = timezone(timedelta(hours=8))
-                event_time = datetime.now(tz_beijing).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+08:00"
-                
-                # 在实际发送请求前生成 timestamp，确保时间戳更准确
-                timestamp_ns = time.time_ns()
-                
-                # 构建 payload 字符串（JSON 字符串）
-                payload_data = {
-                    "msgId": f"dn_{device_id}",
-                    "mid": int(time.time() * 1000) % 100000,
-                    "serviceId": "bench",
-                    "deviceId": device_id,
-                    "businessID": f"{device_id}_1001",
-                    "cmd": "bench",
-                    "expire": -1,
-                    "paras": {"timestamp": timestamp_ns},
-                    "eventTime": event_time,
-                }
-                
-                payload = {
-                    "payload": json.dumps(payload_data),
-                    "properties": {
-                        "message_expiry_interval": 5
-                    },
-                    "qos": 1,
-                    "topic": f"/v1/devices/{device_id}/command"
-                }
-                
-                headers = {
-                    "Authorization": f"Basic {self.token}",
-                    "Content-Type": "application/json",
-                }
-                
-                async with session.post(
-                    self.url,
-                    json=payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=self.timeout),
-                ) as response:
-                    elapsed = time.time() - start_time
-                    response_text = await response.text()
-                    return {
-                        "device_id": device_id,
-                        "status": response.status,
-                        "success": 200 <= response.status < 300,
-                        "elapsed": elapsed,
-                        "response": response_text[:200],  # 限制响应长度
+            # 在实际发送请求前生成 timestamp，确保时间戳更准确
+            timestamp_ns = time.time_ns()
+            
+            payload = {
+                "command": json.dumps(
+                    {
+                        "cmd": "bench",
+                        "paras": {"timestamp": timestamp_ns},
+                        "serviceId": "bench",
                     }
-            else:
-                # 原始格式的请求
-                # 在实际发送请求前生成 timestamp，确保时间戳更准确
-                timestamp_ns = time.time_ns()
+                ),
+                "commandType": 1,
+                "deviceId": device_id,
+                "gatewayId": device_id,
+                "expire": 5,
+                "qos": 1,
+            }
+
+            # 如果提供了 productId，添加到 payload 中
+            if self.productid:
+                payload["productId"] = self.productid
+                payload["gatewayProductId"] = self.productid
+
+            headers = {}
+            if self.edgenodeid:
+                headers["edgeNodeId"] = self.edgenodeid
+            
+            async with session.post(
+                self.url,
+                json=payload,
+                headers=headers if headers else None,
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+            ) as response:
+                elapsed = time.time() - start_time
+                response_text = await response.text()
                 
-                payload = {
-                    "command": json.dumps(
-                        {
-                            "cmd": "bench",
-                            "paras": {"timestamp": timestamp_ns},
-                            "serviceId": "bench",
-                        }
-                    ),
-                    "commandType": 1,
-                    "deviceId": device_id,
-                    "gatewayId": device_id,
-                    "expire": 5,
-                    "qos": 1,
+                # 检查 HTTP 状态码
+                http_success = 200 <= response.status < 300
+                
+                # 需要检查业务 code
+                business_success = False
+                if http_success:
+                    try:
+                        response_json = json.loads(response_text)
+                        # 检查业务 code 是否为 0
+                        if isinstance(response_json, dict) and response_json.get("code") == 0:
+                            business_success = True
+                        else:
+                            # HTTP 成功但业务 code 不为 0，打印响应内容
+                            print(f"[ERROR] Device {device_id}: HTTP {response.status} but business code is not 0. Response: {response_text[:500]}")
+                    except (json.JSONDecodeError, AttributeError, TypeError) as e:
+                        # JSON 解析失败或格式不正确，认为业务失败
+                        print(f"[ERROR] Device {device_id}: Failed to parse JSON response. Error: {e}. Response: {response_text[:500]}")
+                else:
+                    # HTTP 状态码不成功，打印响应内容
+                    print(f"[ERROR] Device {device_id}: HTTP {response.status}. Response: {response_text[:500]}")
+                
+                return {
+                    "device_id": device_id,
+                    "status": response.status,
+                    "success": http_success and business_success,
+                    "elapsed": elapsed,
+                    "response": response_text[:500],  # 增加响应长度以便调试
                 }
-
-                # 如果提供了 productId，添加到 payload 中
-                if self.productid:
-                    payload["productId"] = self.productid
-                    payload["gatewayProductId"] = self.productid
-
-                headers = {}
-                if self.edgenodeid:
-                    headers["edgeNodeId"] = self.edgenodeid
-                
-                async with session.post(
-                    self.url,
-                    json=payload,
-                    headers=headers if headers else None,
-                    timeout=aiohttp.ClientTimeout(total=self.timeout),
-                ) as response:
-                    elapsed = time.time() - start_time
-                    response_text = await response.text()
-                    
-                    # 检查 HTTP 状态码
-                    http_success = 200 <= response.status < 300
-                    
-                    # 非 emqx 模式下，需要检查业务 code
-                    business_success = False
-                    if http_success:
-                        try:
-                            response_json = json.loads(response_text)
-                            # 检查业务 code 是否为 0
-                            if isinstance(response_json, dict) and response_json.get("code") == 0:
-                                business_success = True
-                            else:
-                                # HTTP 成功但业务 code 不为 0，打印响应内容
-                                print(f"[ERROR] Device {device_id}: HTTP {response.status} but business code is not 0. Response: {response_text[:500]}")
-                        except (json.JSONDecodeError, AttributeError, TypeError) as e:
-                            # JSON 解析失败或格式不正确，认为业务失败
-                            print(f"[ERROR] Device {device_id}: Failed to parse JSON response. Error: {e}. Response: {response_text[:500]}")
-                    else:
-                        # HTTP 状态码不成功，打印响应内容
-                        print(f"[ERROR] Device {device_id}: HTTP {response.status}. Response: {response_text[:500]}")
-                    
-                    return {
-                        "device_id": device_id,
-                        "status": response.status,
-                        "success": http_success and business_success,
-                        "elapsed": elapsed,
-                        "response": response_text[:500],  # 增加响应长度以便调试
-                    }
         except Exception as e:
             elapsed = time.time() - start_time
             return {
@@ -254,7 +196,6 @@ class StressTester:
 
         print(f"\n开始压力测试:")
         print(f"  URL: {self.url}")
-        print(f"  模式: {'EMQX' if self.emqx else '标准'}")
         print(f"  并发数: {self.concurrent}")
         print(f"  DeviceId 数量: {len(self.device_ids)}")
         print(f"  每个 DeviceId 循环次数: {self.loop_count}")
@@ -393,21 +334,10 @@ def main():
         help="请求超时时间（秒）(默认: 30)",
     )
     parser.add_argument(
-        "--emqx",
-        action="store_true",
-        help=SUPPRESS,
-    )
-    parser.add_argument(
         "--edgenodeid",
         type=str,
         default=None,
-        help="Edge Node ID，用于非 EMQX 模式的 HTTP Header",
-    )
-    parser.add_argument(
-        "--token",
-        type=str,
-        default=None,
-        help="Token，用于 EMQX 模式的 Authorization Header (Basic {token})",
+        help="Edge Node ID，用于 HTTP Header",
     )
     parser.add_argument(
         "--productid",
@@ -418,13 +348,9 @@ def main():
 
     args = parser.parse_args()
     
-    # 非 emqx 模式下，edgenodeid 是必需的
-    if not args.emqx and not args.edgenodeid:
-        parser.error("--edgenodeid 参数在非 EMQX 模式下是必需的")
-    
-    # emqx 模式下，token 是必需的
-    if args.emqx and not args.token:
-        parser.error("--token 参数在 EMQX 模式下是必需的")
+    # edgenodeid 是必需的
+    if not args.edgenodeid:
+        parser.error("--edgenodeid 参数是必需的")
 
     tester = StressTester(
         url=args.url,
@@ -434,9 +360,7 @@ def main():
         loop_count=args.loop_count,
         interval=args.interval,
         timeout=args.timeout,
-        emqx=args.emqx,
         edgenodeid=args.edgenodeid,
-        token=args.token,
         productid=args.productid,
     )
 
