@@ -33,6 +33,7 @@ class StressTester:
         emqx: bool = False,
         edgenodeid: str = None,
         token: str = None,
+        productid: str = None,
     ):
         self.url = url
         self.csv_file = csv_file
@@ -44,6 +45,7 @@ class StressTester:
         self.emqx = emqx
         self.edgenodeid = edgenodeid
         self.token = token
+        self.productid = productid
         self.device_ids: List[str] = []
         self.stats = {
             "total": 0,
@@ -134,10 +136,16 @@ class StressTester:
                     ),
                     "commandType": 1,
                     "deviceId": device_id,
+                    "gatewayId": device_id,
                     "expire": 5,
                     "qos": 1,
                 }
-                
+
+                # 如果提供了 productId，添加到 payload 中
+                if self.productid:
+                    payload["productId"] = self.productid
+                    payload["gatewayProductId"] = self.productid
+
                 headers = {}
                 if self.edgenodeid:
                     headers["edgeNodeId"] = self.edgenodeid
@@ -401,6 +409,12 @@ def main():
         default=None,
         help="Token，用于 EMQX 模式的 Authorization Header (Basic {token})",
     )
+    parser.add_argument(
+        "--productid",
+        type=str,
+        default=None,
+        help="Product ID，用于原始格式的请求 payload",
+    )
 
     args = parser.parse_args()
     
@@ -423,6 +437,7 @@ def main():
         emqx=args.emqx,
         edgenodeid=args.edgenodeid,
         token=args.token,
+        productid=args.productid,
     )
 
     try:
