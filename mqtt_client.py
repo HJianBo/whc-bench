@@ -49,6 +49,8 @@ class MQTTClient:
         self.stats = {
             "messages_received": 0,
             "latencies": [],
+            "receive_latencies": [],  # receivedAt - timestamp (命令接收时间延迟)
+            "handle_latencies": [],   # handledAt - timestamp (命令处理延迟)
             "errors": [],
         }
         self.running = True
@@ -92,6 +94,58 @@ class MQTTClient:
                     
                     self.stats["messages_received"] += 1
                     self.stats["latencies"].append(latency_ns)
+                    
+                    # 提取 User-Property 中的 receivedAt 和 handledAt
+                    received_at_ms = None
+                    handled_at_ms = None
+                    
+                    # 尝试从消息的 User-Property 中获取 receivedAt 和 handledAt
+                    if hasattr(message, 'properties') and message.properties:
+                        user_properties = getattr(message.properties, 'user_properties', None)
+                        if user_properties:
+                            # user_properties 是一个列表，每个元素是 (key, value) 元组
+                            for key, value in user_properties:
+                                if key == "receivedAt":
+                                    try:
+                                        received_at_ms = float(value)
+                                    except (ValueError, TypeError):
+                                        pass
+                                elif key == "handledAt":
+                                    try:
+                                        handled_at_ms = float(value)
+                                    except (ValueError, TypeError):
+                                        pass
+                    
+                    # 如果存在 User-Property 时间戳，计算延迟
+                    if received_at_ms is not None or handled_at_ms is not None:
+                        # timestamp 可能是纳秒或毫秒，需要统一转换为毫秒
+                        # 判断 timestamp 的单位（纳秒通常 > 1e12，毫秒通常 < 1e12）
+                        if timestamp > 1e12:
+                            timestamp_ms = timestamp / 1_000_000.0  # 纳秒转毫秒
+                        else:
+                            timestamp_ms = timestamp  # 已经是毫秒
+                        
+                        # 计算命令接收时间延迟：receivedAt - timestamp
+                        if received_at_ms is not None:
+                            receive_latency_ms = received_at_ms - timestamp_ms
+                            self.stats["receive_latencies"].append(receive_latency_ms)
+                            
+                            # 更新全局统计
+                            if hasattr(self, 'manager_instance') and self.manager_instance:
+                                asyncio.create_task(
+                                    self.manager_instance.update_receive_latency(receive_latency_ms)
+                                )
+                        
+                        # 计算命令处理延迟：handledAt - timestamp
+                        if handled_at_ms is not None:
+                            handle_latency_ms = handled_at_ms - timestamp_ms
+                            self.stats["handle_latencies"].append(handle_latency_ms)
+                            
+                            # 更新全局统计
+                            if hasattr(self, 'manager_instance') and self.manager_instance:
+                                asyncio.create_task(
+                                    self.manager_instance.update_handle_latency(handle_latency_ms)
+                                )
                     
                     # 转换为带小数的毫秒显示
                     latency_ms = latency_ns / 1_000_000.0
@@ -243,6 +297,8 @@ class MQTTClient:
     def get_stats(self) -> Dict:
         """获取统计信息"""
         latencies = self.stats["latencies"]
+        receive_latencies = self.stats["receive_latencies"]
+        handle_latencies = self.stats["handle_latencies"]
         stats = {
             "device_id": self.device_id,
             "messages_received": self.stats["messages_received"],
@@ -256,6 +312,24 @@ class MQTTClient:
             stats["latency_p50"] = sorted(latencies)[len(latencies) // 2]
             stats["latency_p95"] = sorted(latencies)[int(len(latencies) * 0.95)]
             stats["latency_p99"] = sorted(latencies)[int(len(latencies) * 0.99)]
+        
+        # 命令接收时间延迟统计（receivedAt - timestamp）
+        if receive_latencies:
+            stats["receive_latency_avg"] = sum(receive_latencies) / len(receive_latencies)
+            stats["receive_latency_min"] = min(receive_latencies)
+            stats["receive_latency_max"] = max(receive_latencies)
+            stats["receive_latency_p50"] = sorted(receive_latencies)[len(receive_latencies) // 2]
+            stats["receive_latency_p95"] = sorted(receive_latencies)[int(len(receive_latencies) * 0.95)]
+            stats["receive_latency_p99"] = sorted(receive_latencies)[int(len(receive_latencies) * 0.99)]
+        
+        # 命令处理延迟统计（handledAt - timestamp）
+        if handle_latencies:
+            stats["handle_latency_avg"] = sum(handle_latencies) / len(handle_latencies)
+            stats["handle_latency_min"] = min(handle_latencies)
+            stats["handle_latency_max"] = max(handle_latencies)
+            stats["handle_latency_p50"] = sorted(handle_latencies)[len(handle_latencies) // 2]
+            stats["handle_latency_p95"] = sorted(handle_latencies)[int(len(handle_latencies) * 0.95)]
+            stats["handle_latency_p99"] = sorted(handle_latencies)[int(len(handle_latencies) * 0.99)]
         
         return stats
 
@@ -295,6 +369,8 @@ class MQTTClientManager:
         self.total_messages = 0
         self.total_errors = 0
         self.all_latencies: List[float] = []  # 存储毫秒单位的时延
+        self.all_receive_latencies: List[float] = []  # 存储命令接收时间延迟（receivedAt - timestamp）
+        self.all_handle_latencies: List[float] = []  # 存储命令处理延迟（handledAt - timestamp）
         self.recent_100_latencies: List[float] = []  # 最近100条消息的时延
         self.lock = asyncio.Lock()  # 用于线程安全的统计更新
 
@@ -315,6 +391,16 @@ class MQTTClientManager:
                 avg_latency = sum(self.recent_100_latencies) / len(self.recent_100_latencies)
                 print(f"收到 {self.total_messages} 条消息，最近100条平均时延: {avg_latency:.3f}ms")
                 self.recent_100_latencies.clear()  # 清空，准备下一批100条
+    
+    async def update_receive_latency(self, receive_latency_ms: float) -> None:
+        """更新命令接收时间延迟统计"""
+        async with self.lock:
+            self.all_receive_latencies.append(receive_latency_ms)
+    
+    async def update_handle_latency(self, handle_latency_ms: float) -> None:
+        """更新命令处理延迟统计"""
+        async with self.lock:
+            self.all_handle_latencies.append(handle_latency_ms)
     
     async def update_error_count(self) -> None:
         """更新全局错误统计"""
@@ -472,6 +558,40 @@ class MQTTClientManager:
             print(f"  P50 时延: {p50_ms:.3f}ms")
             print(f"  P95 时延: {p95_ms:.3f}ms")
             print(f"  P99 时延: {p99_ms:.3f}ms")
+        
+        # 命令接收时间延迟统计（receivedAt - timestamp）
+        if self.all_receive_latencies:
+            print(f"\n命令接收时间延迟统计 (receivedAt - timestamp):")
+            avg_ms = sum(self.all_receive_latencies) / len(self.all_receive_latencies)
+            min_ms = min(self.all_receive_latencies)
+            max_ms = max(self.all_receive_latencies)
+            sorted_latencies = sorted(self.all_receive_latencies)
+            p50_ms = sorted_latencies[len(sorted_latencies) // 2]
+            p95_ms = sorted_latencies[int(len(sorted_latencies) * 0.95)]
+            p99_ms = sorted_latencies[int(len(sorted_latencies) * 0.99)]
+            print(f"  平均延迟: {avg_ms:.3f}ms")
+            print(f"  最小延迟: {min_ms:.3f}ms")
+            print(f"  最大延迟: {max_ms:.3f}ms")
+            print(f"  P50 延迟: {p50_ms:.3f}ms")
+            print(f"  P95 延迟: {p95_ms:.3f}ms")
+            print(f"  P99 延迟: {p99_ms:.3f}ms")
+        
+        # 命令处理延迟统计（handledAt - timestamp）
+        if self.all_handle_latencies:
+            print(f"\n命令处理延迟统计 (handledAt - timestamp):")
+            avg_ms = sum(self.all_handle_latencies) / len(self.all_handle_latencies)
+            min_ms = min(self.all_handle_latencies)
+            max_ms = max(self.all_handle_latencies)
+            sorted_latencies = sorted(self.all_handle_latencies)
+            p50_ms = sorted_latencies[len(sorted_latencies) // 2]
+            p95_ms = sorted_latencies[int(len(sorted_latencies) * 0.95)]
+            p99_ms = sorted_latencies[int(len(sorted_latencies) * 0.99)]
+            print(f"  平均延迟: {avg_ms:.3f}ms")
+            print(f"  最小延迟: {min_ms:.3f}ms")
+            print(f"  最大延迟: {max_ms:.3f}ms")
+            print(f"  P50 延迟: {p50_ms:.3f}ms")
+            print(f"  P95 延迟: {p95_ms:.3f}ms")
+            print(f"  P99 延迟: {p99_ms:.3f}ms")
         
         print("=" * 80)
 
