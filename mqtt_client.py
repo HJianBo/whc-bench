@@ -18,7 +18,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from aiomqtt import Client
+from aiomqtt import Client, ProtocolVersion
 from aiomqtt.exceptions import MqttError
 
 from utils import load_device_ids
@@ -100,8 +100,9 @@ class MQTTClient:
                     handled_at_ms = None
                     
                     # 尝试从消息的 User-Property 中获取 receivedAt 和 handledAt
+                    # paho.mqtt.properties.Properties 使用 UserProperty (大写P) 而不是 user_properties
                     if hasattr(message, 'properties') and message.properties:
-                        user_properties = getattr(message.properties, 'user_properties', None)
+                        user_properties = getattr(message.properties, 'UserProperty', None)
                         if user_properties:
                             # user_properties 是一个列表，每个元素是 (key, value) 元组
                             for key, value in user_properties:
@@ -261,6 +262,7 @@ class MQTTClient:
     async def connect_and_subscribe(self) -> None:
         """连接 MQTT Broker 并订阅主题"""
         try:
+            # 使用 MQTT v5 协议以支持 User Properties
             async with Client(
                 hostname=self.broker_host,
                 port=self.broker_port,
@@ -268,11 +270,12 @@ class MQTTClient:
                 username="admin",
                 password=self.password,
                 keepalive=self.keepalive,
+                protocol=ProtocolVersion.V5,
             ) as client:
                 # 保存client引用以便在on_message中发布回复消息
                 self.client = client
                 
-                print(f"[{self.device_id}] 已连接到 MQTT Broker {self.broker_host}:{self.broker_port}")
+                print(f"[{self.device_id}] 已连接到 MQTT Broker {self.broker_host}:{self.broker_port} (MQTT v5)")
                 
                 # 订阅主题
                 await client.subscribe(self.topic, qos=1)
@@ -627,6 +630,8 @@ async def main_async(args) -> int:
     except Exception as e:
         print(f"\n错误: {e}")
         manager.stop_all()
+        await asyncio.sleep(1)  # 等待任务清理
+        manager.print_stats()
         return 1
     finally:
         _manager_instance = None
@@ -636,6 +641,7 @@ async def main_async(args) -> int:
 
 def main():
     """主函数"""
+    global _manager_instance
     parser = ArgumentParser(description="MQTT 客户端程序")
     parser.add_argument(
         "--broker",
@@ -699,7 +705,6 @@ def main():
         return exit_code
     except KeyboardInterrupt:
         # 如果还有 manager 实例，打印统计信息
-        global _manager_instance
         if _manager_instance:
             # 创建一个新的事件循环来运行清理代码
             loop = asyncio.new_event_loop()
@@ -712,6 +717,16 @@ def main():
         return 0
     except Exception as e:
         print(f"\n错误: {e}")
+        # 如果还有 manager 实例，打印统计信息
+        if _manager_instance:
+            # 创建一个新的事件循环来运行清理代码
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(asyncio.sleep(1))
+                _manager_instance.print_stats()
+            finally:
+                loop.close()
         return 1
 
 
