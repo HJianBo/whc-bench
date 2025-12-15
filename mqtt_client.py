@@ -51,6 +51,8 @@ class MQTTClient:
             "latencies": [],
             "receive_latencies": [],  # receivedAt - timestamp (命令接收时间延迟)
             "handle_latencies": [],   # handledAt - timestamp (命令处理延迟)
+            "delivered1_latencies": [],  # deliveredAt1 - timestamp (开始处理投递延迟)
+            "delivered2_latencies": [],  # deliveredAt2 - timestamp (处理投递完成延迟)
             "errors": [],
         }
         self.running = True
@@ -95,11 +97,13 @@ class MQTTClient:
                     self.stats["messages_received"] += 1
                     self.stats["latencies"].append(latency_ns)
                     
-                    # 提取 User-Property 中的 receivedAt 和 handledAt
+                    # 提取 User-Property 中的 receivedAt、handledAt、deliveredAt1 和 deliveredAt2
                     received_at_ms = None
                     handled_at_ms = None
+                    delivered_at1_ms = None
+                    delivered_at2_ms = None
                     
-                    # 尝试从消息的 User-Property 中获取 receivedAt 和 handledAt
+                    # 尝试从消息的 User-Property 中获取 receivedAt、handledAt、deliveredAt1 和 deliveredAt2
                     # paho.mqtt.properties.Properties 使用 UserProperty (大写P) 而不是 user_properties
                     if hasattr(message, 'properties') and message.properties:
                         user_properties = getattr(message.properties, 'UserProperty', None)
@@ -116,9 +120,23 @@ class MQTTClient:
                                         handled_at_ms = float(value)
                                     except (ValueError, TypeError):
                                         pass
+                                elif key == "deliveredAt1":
+                                    try:
+                                        delivered_at1_ms = float(value)
+                                    except (ValueError, TypeError):
+                                        pass
+                                elif key == "deliveredAt2":
+                                    try:
+                                        delivered_at2_ms = float(value)
+                                    except (ValueError, TypeError):
+                                        pass
+                    
+                    # 初始化延迟变量（用于 CSV 输出）
+                    delivered1_diff_ms = None
+                    delivered2_diff_ms = None
                     
                     # 如果存在 User-Property 时间戳，计算延迟
-                    if received_at_ms is not None or handled_at_ms is not None:
+                    if received_at_ms is not None or handled_at_ms is not None or delivered_at1_ms is not None or delivered_at2_ms is not None:
                         # timestamp 可能是纳秒或毫秒，需要统一转换为毫秒
                         # 判断 timestamp 的单位（纳秒通常 > 1e12，毫秒通常 < 1e12）
                         if timestamp > 1e12:
@@ -147,6 +165,30 @@ class MQTTClient:
                                 asyncio.create_task(
                                     self.manager_instance.update_handle_latency(handle_latency_ms)
                                 )
+                        
+                        # 计算开始处理投递延迟：deliveredAt1 - timestamp
+                        if delivered_at1_ms is not None:
+                            delivered1_latency_ms = delivered_at1_ms - timestamp_ms
+                            delivered1_diff_ms = delivered1_latency_ms  # 保存用于 CSV 输出
+                            self.stats["delivered1_latencies"].append(delivered1_latency_ms)
+                            
+                            # 更新全局统计
+                            if hasattr(self, 'manager_instance') and self.manager_instance:
+                                asyncio.create_task(
+                                    self.manager_instance.update_delivered1_latency(delivered1_latency_ms)
+                                )
+                        
+                        # 计算处理投递完成延迟：deliveredAt2 - timestamp
+                        if delivered_at2_ms is not None:
+                            delivered2_latency_ms = delivered_at2_ms - timestamp_ms
+                            delivered2_diff_ms = delivered2_latency_ms  # 保存用于 CSV 输出
+                            self.stats["delivered2_latencies"].append(delivered2_latency_ms)
+                            
+                            # 更新全局统计
+                            if hasattr(self, 'manager_instance') and self.manager_instance:
+                                asyncio.create_task(
+                                    self.manager_instance.update_delivered2_latency(delivered2_latency_ms)
+                                )
                     
                     # 转换为带小数的毫秒显示
                     latency_ms = latency_ns / 1_000_000.0
@@ -154,11 +196,11 @@ class MQTTClient:
                     receive_time_ms = receive_time_ns / 1_000_000.0
                     
                     # 异步将延迟数据放入队列（不阻塞消息循环）
-                    # 格式：(ClientId, TS, CommandDiff)
+                    # 格式：(ClientId, TS, CommandDiff, DeliveredAt1Diff, DeliveredAt2Diff)
                     if self.latency_queue:
                         asyncio.create_task(
                             self.latency_queue.put(
-                                (self.device_id, receive_time_ms, latency_ms)
+                                (self.device_id, receive_time_ms, latency_ms, delivered1_diff_ms, delivered2_diff_ms)
                             )
                         )
                     
@@ -302,6 +344,8 @@ class MQTTClient:
         latencies = self.stats["latencies"]
         receive_latencies = self.stats["receive_latencies"]
         handle_latencies = self.stats["handle_latencies"]
+        delivered1_latencies = self.stats["delivered1_latencies"]
+        delivered2_latencies = self.stats["delivered2_latencies"]
         stats = {
             "device_id": self.device_id,
             "messages_received": self.stats["messages_received"],
@@ -333,6 +377,24 @@ class MQTTClient:
             stats["handle_latency_p50"] = sorted(handle_latencies)[len(handle_latencies) // 2]
             stats["handle_latency_p95"] = sorted(handle_latencies)[int(len(handle_latencies) * 0.95)]
             stats["handle_latency_p99"] = sorted(handle_latencies)[int(len(handle_latencies) * 0.99)]
+        
+        # 开始处理投递延迟统计（deliveredAt1 - timestamp）
+        if delivered1_latencies:
+            stats["delivered1_latency_avg"] = sum(delivered1_latencies) / len(delivered1_latencies)
+            stats["delivered1_latency_min"] = min(delivered1_latencies)
+            stats["delivered1_latency_max"] = max(delivered1_latencies)
+            stats["delivered1_latency_p50"] = sorted(delivered1_latencies)[len(delivered1_latencies) // 2]
+            stats["delivered1_latency_p95"] = sorted(delivered1_latencies)[int(len(delivered1_latencies) * 0.95)]
+            stats["delivered1_latency_p99"] = sorted(delivered1_latencies)[int(len(delivered1_latencies) * 0.99)]
+        
+        # 处理投递完成延迟统计（deliveredAt2 - timestamp）
+        if delivered2_latencies:
+            stats["delivered2_latency_avg"] = sum(delivered2_latencies) / len(delivered2_latencies)
+            stats["delivered2_latency_min"] = min(delivered2_latencies)
+            stats["delivered2_latency_max"] = max(delivered2_latencies)
+            stats["delivered2_latency_p50"] = sorted(delivered2_latencies)[len(delivered2_latencies) // 2]
+            stats["delivered2_latency_p95"] = sorted(delivered2_latencies)[int(len(delivered2_latencies) * 0.95)]
+            stats["delivered2_latency_p99"] = sorted(delivered2_latencies)[int(len(delivered2_latencies) * 0.99)]
         
         return stats
 
@@ -374,6 +436,8 @@ class MQTTClientManager:
         self.all_latencies: List[float] = []  # 存储毫秒单位的时延
         self.all_receive_latencies: List[float] = []  # 存储命令接收时间延迟（receivedAt - timestamp）
         self.all_handle_latencies: List[float] = []  # 存储命令处理延迟（handledAt - timestamp）
+        self.all_delivered1_latencies: List[float] = []  # 存储开始处理投递延迟（deliveredAt1 - timestamp）
+        self.all_delivered2_latencies: List[float] = []  # 存储处理投递完成延迟（deliveredAt2 - timestamp）
         self.recent_100_latencies: List[float] = []  # 最近100条消息的时延
         self.lock = asyncio.Lock()  # 用于线程安全的统计更新
 
@@ -405,6 +469,16 @@ class MQTTClientManager:
         async with self.lock:
             self.all_handle_latencies.append(handle_latency_ms)
     
+    async def update_delivered1_latency(self, delivered1_latency_ms: float) -> None:
+        """更新开始处理投递延迟统计"""
+        async with self.lock:
+            self.all_delivered1_latencies.append(delivered1_latency_ms)
+    
+    async def update_delivered2_latency(self, delivered2_latency_ms: float) -> None:
+        """更新处理投递完成延迟统计"""
+        async with self.lock:
+            self.all_delivered2_latencies.append(delivered2_latency_ms)
+    
     async def update_error_count(self) -> None:
         """更新全局错误统计"""
         async with self.lock:
@@ -416,14 +490,14 @@ class MQTTClientManager:
         def write_header():
             with open(self.output_csv_file, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["ClientId", "TS", "CommandDiff"])
+                writer.writerow(["ClientId", "TS", "CommandDiff", "DeliveredAt1Diff", "DeliveredAt2Diff"])
 
         await asyncio.to_thread(write_header)
         print(f"延迟统计将输出到: {self.output_csv_file}")
 
         # 批量写入缓冲区
-        # 格式：(ClientId, TS, CommandDiff)
-        buffer: List[Tuple[str, float, float]] = []
+        # 格式：(ClientId, TS, CommandDiff, DeliveredAt1Diff, DeliveredAt2Diff)
+        buffer: List[Tuple[str, float, float, Optional[float], Optional[float]]] = []
         buffer_size = 100  # 每 100 条记录写入一次
 
         def write_batch():
@@ -433,10 +507,16 @@ class MQTTClientManager:
                     self.output_csv_file, "a", newline="", encoding="utf-8"
                 ) as f:
                     writer = csv.writer(f)
-                    # 格式化数据：ClientId, TS (保留3位小数), CommandDiff (保留3位小数)
+                    # 格式化数据：ClientId, TS (保留3位小数), CommandDiff (保留3位小数), DeliveredAt1Diff, DeliveredAt2Diff
                     formatted_rows = [
-                        (client_id, f"{ts:.3f}", f"{latency:.3f}")
-                        for client_id, ts, latency in buffer
+                        (
+                            client_id,
+                            f"{ts:.3f}",
+                            f"{latency:.3f}",
+                            f"{delivered1_diff:.3f}" if delivered1_diff is not None else "",
+                            f"{delivered2_diff:.3f}" if delivered2_diff is not None else ""
+                        )
+                        for client_id, ts, latency, delivered1_diff, delivered2_diff in buffer
                     ]
                     writer.writerows(formatted_rows)
                 buffer.clear()
@@ -586,6 +666,40 @@ class MQTTClientManager:
             min_ms = min(self.all_handle_latencies)
             max_ms = max(self.all_handle_latencies)
             sorted_latencies = sorted(self.all_handle_latencies)
+            p50_ms = sorted_latencies[len(sorted_latencies) // 2]
+            p95_ms = sorted_latencies[int(len(sorted_latencies) * 0.95)]
+            p99_ms = sorted_latencies[int(len(sorted_latencies) * 0.99)]
+            print(f"  平均延迟: {avg_ms:.3f}ms")
+            print(f"  最小延迟: {min_ms:.3f}ms")
+            print(f"  最大延迟: {max_ms:.3f}ms")
+            print(f"  P50 延迟: {p50_ms:.3f}ms")
+            print(f"  P95 延迟: {p95_ms:.3f}ms")
+            print(f"  P99 延迟: {p99_ms:.3f}ms")
+        
+        # 开始处理投递延迟统计（deliveredAt1 - timestamp）
+        if self.all_delivered1_latencies:
+            print(f"\n开始处理投递延迟统计 (deliveredAt1 - timestamp):")
+            avg_ms = sum(self.all_delivered1_latencies) / len(self.all_delivered1_latencies)
+            min_ms = min(self.all_delivered1_latencies)
+            max_ms = max(self.all_delivered1_latencies)
+            sorted_latencies = sorted(self.all_delivered1_latencies)
+            p50_ms = sorted_latencies[len(sorted_latencies) // 2]
+            p95_ms = sorted_latencies[int(len(sorted_latencies) * 0.95)]
+            p99_ms = sorted_latencies[int(len(sorted_latencies) * 0.99)]
+            print(f"  平均延迟: {avg_ms:.3f}ms")
+            print(f"  最小延迟: {min_ms:.3f}ms")
+            print(f"  最大延迟: {max_ms:.3f}ms")
+            print(f"  P50 延迟: {p50_ms:.3f}ms")
+            print(f"  P95 延迟: {p95_ms:.3f}ms")
+            print(f"  P99 延迟: {p99_ms:.3f}ms")
+        
+        # 处理投递完成延迟统计（deliveredAt2 - timestamp）
+        if self.all_delivered2_latencies:
+            print(f"\n处理投递完成延迟统计 (deliveredAt2 - timestamp):")
+            avg_ms = sum(self.all_delivered2_latencies) / len(self.all_delivered2_latencies)
+            min_ms = min(self.all_delivered2_latencies)
+            max_ms = max(self.all_delivered2_latencies)
+            sorted_latencies = sorted(self.all_delivered2_latencies)
             p50_ms = sorted_latencies[len(sorted_latencies) // 2]
             p95_ms = sorted_latencies[int(len(sorted_latencies) * 0.95)]
             p99_ms = sorted_latencies[int(len(sorted_latencies) * 0.99)]
