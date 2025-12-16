@@ -79,22 +79,22 @@ jobs:
     - name: 📝 Create Installation README
       shell: bash
       run: |
-        cat > wrk_offline_el8/README.txt << 'EOF'
-wrk 离线安装包 - EL8 (CentOS/Rocky 8)
-
-安装步骤：
-1. 安装依赖包：
-   sudo dnf install -y *.rpm
-
-2. 安装 wrk 二进制文件：
-   sudo cp bin/wrk /usr/local/bin/
-   sudo chmod +x /usr/local/bin/wrk
-
-3. 验证安装：
-   wrk --version
-
-注意：此离线包包含编译好的 wrk 二进制文件和所有构建依赖的 RPM 包。
-EOF
+        {
+          echo "wrk 离线安装包 - EL8 (CentOS/Rocky 8)"
+          echo ""
+          echo "安装步骤："
+          echo "1. 安装依赖包："
+          echo "   sudo dnf install -y *.rpm"
+          echo ""
+          echo "2. 安装 wrk 二进制文件："
+          echo "   sudo cp bin/wrk /usr/local/bin/"
+          echo "   sudo chmod +x /usr/local/bin/wrk"
+          echo ""
+          echo "3. 验证安装："
+          echo "   wrk --version"
+          echo ""
+          echo "注意：此离线包包含编译好的 wrk 二进制文件和所有构建依赖的 RPM 包。"
+        } > wrk_offline_el8/README.txt
         echo "Created README.txt:"
         cat wrk_offline_el8/README.txt
 
