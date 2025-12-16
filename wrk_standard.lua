@@ -90,7 +90,11 @@ function init(args)
         device_ids = loaded_ids
     else
         if #device_ids == 0 then
-            error("device_ids 列表为空，请确保 CSV 文件存在或使用 generate_wrk_script.py 生成脚本")
+            local error_msg = "device_ids 列表为空，请确保 CSV 文件存在或使用 generate_wrk_script.py 生成脚本"
+            if err then
+                error_msg = error_msg .. " (" .. err .. ")"
+            end
+            error(error_msg)
         end
     end
     
