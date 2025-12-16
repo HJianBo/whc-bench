@@ -10,15 +10,14 @@ local csv_file = "devices.csv"
 -- 每个设备的请求计数器（用于 mid）
 local device_counters = {}
 
--- 请求统计（使用全局变量以便在 done() 中访问）
-failed_requests = {}
-failed_count = 0
-success_count = 0
-total_count = 0
-status_code_counts = {}
-all_request_samples = {}  -- 保存所有请求样本
-max_failed_samples = 10  -- 最多保存的失败请求样本数
-max_all_samples = 20  -- 最多保存的所有请求样本数
+-- 当前设备索引（用于按顺序轮流选择设备）
+local current_device_index = 1
+
+-- 打印响应结果开关（默认为打开）
+print_responses = false
+-- 打印响应计数器（用于限制打印数量，避免输出过多）
+print_response_count = 0
+max_print_responses = 100  -- 最多打印的响应数量（0 表示不限制）
 
 -- 从 CSV 文件读取 device IDs
 local function load_device_ids_from_csv(file_path)
@@ -89,6 +88,9 @@ function init(args)
     for i, device_id in ipairs(device_ids) do
         device_counters[device_id] = 0
     end
+    
+    -- 初始化当前设备索引
+    current_device_index = 1
 end
 
 -- 生成 UUID v4（32 位十六进制字符串，无连字符）
@@ -101,21 +103,75 @@ function generate_uuid()
     return uuid
 end
 
--- 获取当前时间戳（秒，带小数部分）
+-- 使用 LuaJIT FFI 获取高精度时间戳
+-- wrk 使用 LuaJIT，支持 FFI 调用系统函数
+local ffi = require("ffi")
+local gettimeofday_available = false
+local clock_gettime_available = false
+
+-- 尝试初始化 gettimeofday (微秒级精度)
+pcall(function()
+    ffi.cdef[[
+        typedef long time_t;
+        typedef struct timeval {
+            time_t tv_sec;
+            long tv_usec;
+        } timeval;
+        int gettimeofday(struct timeval *tv, void *tz);
+    ]]
+    gettimeofday_available = true
+end)
+
+-- 尝试初始化 clock_gettime (纳秒级精度，Linux/macOS)
+pcall(function()
+    ffi.cdef[[
+        typedef long time_t;
+        typedef long clockid_t;
+        typedef struct timespec {
+            time_t tv_sec;
+            long tv_nsec;
+        } timespec;
+        int clock_gettime(clockid_t clk_id, struct timespec *tp);
+    ]]
+    clock_gettime_available = true
+end)
+
+-- 获取当前时间戳（秒，带小数部分，高精度）
+-- 优先使用 clock_gettime (纳秒级精度)，其次 gettimeofday (微秒级精度)，最后 os.time() (秒级精度)
 local function get_current_time()
-    if wrk and wrk.time then
-        return wrk.time()
-    else
-        -- 后备方案：使用 os.time()，但没有毫秒精度
-        return os.time()
+    -- 优先使用 clock_gettime (纳秒级精度)
+    if clock_gettime_available then
+        local ts = ffi.new("timespec")
+        -- CLOCK_REALTIME = 0
+        if ffi.C.clock_gettime(0, ts) == 0 then
+            return tonumber(ts.tv_sec) + tonumber(ts.tv_nsec) / 1000000000
+        end
     end
+    
+    -- 其次使用 gettimeofday (微秒级精度)
+    if gettimeofday_available then
+        local tv = ffi.new("timeval")
+        if ffi.C.gettimeofday(tv, nil) == 0 then
+            return tonumber(tv.tv_sec) + tonumber(tv.tv_usec) / 1000000
+        end
+    end
+    
+    -- 后备方案：使用 os.time()，但只有秒级精度
+    return os.time()
 end
 
--- 生成纳秒级时间戳（lua 只支持秒级，这里返回秒*1e9的数字）
+-- 生成纳秒级时间戳（高精度）
+-- 使用 FFI 调用系统函数获取高精度时间戳
+-- clock_gettime 提供纳秒级精度，gettimeofday 提供微秒级精度
 function get_timestamp_ns()
+    -- 使用 get_current_time() 获取高精度时间戳（包含小数部分）
+    -- get_current_time() 会优先使用 clock_gettime (纳秒级)，其次 gettimeofday (微秒级)
     local ts = get_current_time()
-    -- 返回纳秒时间戳（作为数字）
-    -- 注意：lua 的数字精度有限，但对于时间戳来说通常足够
+    -- 乘以 1e9 转换为纳秒时间戳
+    -- 例如：1765893013.123456789 秒 -> 1765893013123456789 纳秒
+    -- 使用 math.floor 确保返回整数纳秒时间戳
+    -- 注意：Lua 使用双精度浮点数，对于纳秒时间戳（约19位）可能会有精度损失
+    -- 但使用 clock_gettime 时可以获得纳秒级精度
     return math.floor(ts * 1000000000)
 end
 
@@ -141,8 +197,12 @@ function request()
         error("device_ids 列表为空，请先使用 generate_wrk_script.py 生成脚本")
     end
     
-    -- 随机选择一个设备 ID
-    local device_id = device_ids[math.random(#device_ids)]
+    -- 按顺序轮流选择一个设备 ID
+    local device_id = device_ids[current_device_index]
+    current_device_index = current_device_index + 1
+    if current_device_index > #device_ids then
+        current_device_index = 1
+    end
     
     -- 初始化计数器（如果不存在）
     if device_counters[device_id] == nil then
@@ -250,137 +310,37 @@ end
 
 -- 响应处理函数：处理每个响应
 function response(status, headers, body)
-    -- 确保变量已初始化
-    if total_count == nil then total_count = 0 end
-    if status_code_counts == nil then status_code_counts = {} end
-    if all_request_samples == nil then all_request_samples = {} end
-    if failed_requests == nil then failed_requests = {} end
-    if failed_count == nil then failed_count = 0 end
-    if success_count == nil then success_count = 0 end
-    
-    total_count = total_count + 1
-    
-    -- 统计状态码
-    status_code_counts[status] = (status_code_counts[status] or 0) + 1
-    
-    -- 保存请求样本（最多保存 max_all_samples 个）
-    if #all_request_samples < max_all_samples then
-        local sample = {
-            status = status,
-            body = body or "",
-            is_success = status >= 200 and status < 400
-        }
-        table.insert(all_request_samples, sample)
+    -- 确保 print_responses 开关已初始化
+    if print_responses == nil then
+        print_responses = true
+    end
+    if print_response_count == nil then
+        print_response_count = 0
+    end
+    if max_print_responses == nil then
+        max_print_responses = 100
     end
     
-    -- 检查是否是失败响应（4xx 和 5xx）
-    if status >= 400 then
-        failed_count = failed_count + 1
-        
-        -- 保存失败请求样本（最多保存 max_failed_samples 个）
-        if #failed_requests < max_failed_samples then
-            local sample = {
-                status = status,
-                body = body or ""
-            }
-            table.insert(failed_requests, sample)
-        end
-    else
-        success_count = success_count + 1
-    end
-end
-
--- 测试结束函数：打印所有请求统计和响应样本
-function done(summary, latency, requests)
-    io.write("\n")
-    io.write("=" .. string.rep("=", 70) .. "\n")
-    io.write("请求统计报告\n")
-    io.write("=" .. string.rep("=", 70) .. "\n")
-    
-    -- 使用 response() 函数收集的统计信息
-    local actual_total = total_count or 0
-    local actual_success = success_count or 0
-    local actual_failed = failed_count or 0
-    
-    -- 安全地检查 summary 结构
-    local summary_requests_complete = nil
-    if summary then
-        if type(summary) == "table" then
-            if summary.requests then
-                if type(summary.requests) == "table" then
-                    summary_requests_complete = summary.requests.complete
-                elseif type(summary.requests) == "number" then
-                    summary_requests_complete = summary.requests
-                end
-            end
-        end
-    end
-    
-    -- 如果 response 函数没有被调用，尝试从 summary 获取信息
-    if actual_total == 0 and summary_requests_complete then
-        actual_total = summary_requests_complete
-        actual_failed = actual_total
-        actual_success = 0
-    end
-    
-    -- 总体统计
-    io.write(string.format("\n总请求数: %d\n", actual_total))
-    io.write(string.format("成功请求: %d (%.2f%%)\n", actual_success, 
-        actual_total > 0 and (actual_success / actual_total) * 100 or 0))
-    io.write(string.format("失败请求: %d (%.2f%%)\n", actual_failed, 
-        actual_total > 0 and (actual_failed / actual_total) * 100 or 0))
-    io.write("\n")
-    
-    -- 状态码分布统计
-    if next(status_code_counts) then
-        io.write("状态码分布:\n")
-        local sorted_status = {}
-        for status, _ in pairs(status_code_counts) do
-            table.insert(sorted_status, status)
-        end
-        table.sort(sorted_status)
-        
-        for _, status in ipairs(sorted_status) do
-            local count = status_code_counts[status]
-            local percentage = total_count > 0 and (count / total_count) * 100 or 0
-            local status_label = ""
-            if status >= 200 and status < 300 then
-                status_label = " (成功)"
-            elseif status >= 300 and status < 400 then
-                status_label = " (重定向)"
-            elseif status >= 400 and status < 500 then
-                status_label = " (客户端错误)"
-            elseif status >= 500 then
-                status_label = " (服务器错误)"
-            end
-            io.write(string.format("  %d%s: %d 次 (%.2f%%)\n", 
-                status, status_label, count, percentage))
-        end
-        io.write("\n")
-    end
-    
-    -- 打印所有请求样本（成功和失败都打印完整响应体）
-    if all_request_samples and #all_request_samples > 0 then
-        io.write("=" .. string.rep("=", 70) .. "\n")
-        io.write("请求响应样本\n")
-        io.write("=" .. string.rep("=", 70) .. "\n")
-        io.write(string.format("\n请求样本 (显示前 %d 个):\n", #all_request_samples))
-        io.write("-" .. string.rep("-", 70) .. "\n")
-        for i, sample in ipairs(all_request_samples) do
-            local status_icon = sample.is_success and "✓" or "✗"
-            local status_label = sample.is_success and "成功" or "失败"
-            io.write(string.format("\n[样本 %d] %s 状态码: %d (%s)\n", i, status_icon, sample.status, status_label))
-            if sample.body and sample.body ~= "" then
-                io.write("响应体:\n")
-                io.write(sample.body .. "\n")
+    -- 如果开关打开，打印响应结果
+    if print_responses ~= false then
+        -- 检查是否超过最大打印数量（0 表示不限制）
+        if max_print_responses == 0 or print_response_count < max_print_responses then
+            print_response_count = print_response_count + 1
+            local status_icon = (status >= 200 and status < 400) and "✓" or "✗"
+            local status_label = (status >= 200 and status < 400) and "成功" or "失败"
+            io.write(string.format("[响应 %d] %s 状态码: %d (%s)\n", print_response_count, status_icon, status, status_label))
+            if body and body ~= "" then
+                io.write("响应体: " .. body .. "\n")
             else
                 io.write("响应体: (无响应体)\n")
             end
             io.write("-" .. string.rep("-", 70) .. "\n")
         end
-        io.write("\n")
     end
-    
-    io.write("\n")
+end
+
+-- 测试结束函数（已简化，不打印统计信息）
+function done(summary, latency, requests)
+    -- 不打印任何统计信息，响应已在 response() 函数中实时打印
 end
 
