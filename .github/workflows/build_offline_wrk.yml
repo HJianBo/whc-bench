@@ -31,8 +31,9 @@ jobs:
         # 清理并重建 dnf 缓存
         dnf clean all
         dnf makecache
-        # 安装 tar 和 gzip 工具，用于后续打包
-        dnf install -y tar gzip git make gcc openssl-devel
+        # 安装编译和打包所需的工具
+        # wrk 编译需要: git, make, gcc, openssl-devel, unzip
+        dnf install -y tar gzip git make gcc openssl-devel unzip
 
     - name: 📦 Download Build Dependencies for wrk
       shell: bash
@@ -42,8 +43,8 @@ jobs:
         mkdir -p wrk_offline_el8
         
         # 下载编译 wrk 所需的依赖包
-        # wrk 需要: gcc, make, openssl-devel, git (用于下载源码)
-        dnf download --resolve --destdir wrk_offline_el8/ gcc make openssl-devel git tar gzip
+        # wrk 需要: gcc, make, openssl-devel, git, unzip (用于下载源码和编译)
+        dnf download --resolve --destdir wrk_offline_el8/ gcc make openssl-devel git tar gzip unzip
         
         # 检查是否下载成功
         if [ $? -ne 0 ]; then
