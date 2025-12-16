@@ -42,25 +42,26 @@ jobs:
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.cargo/bin:$PATH"
 
       - name: Set up Python
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           uv python install 3.13
 
       - name: Install dependencies
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           uv sync --group dev
 
       - name: Build http_stress
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           uv run pyinstaller http_stress.spec
-
-      - name: Build mqtt_client
-        run: |
-          uv run pyinstaller mqtt_client.spec
 
       - name: Build kafka_consumer
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           uv run pyinstaller kafka_consumer.spec
 
       - name: Upload artifacts
@@ -69,7 +70,6 @@ jobs:
           name: executables-centos8
           path: |
             dist/http_stress
-            dist/mqtt_client
             dist/kafka_consumer
           retention-days: 30
 
