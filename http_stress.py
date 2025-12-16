@@ -7,11 +7,13 @@ HTTP 压力测试工具
 import asyncio
 import json
 import sys
+import threading
 import time
 from argparse import ArgumentParser
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
-from typing import List
+from queue import Queue
+from typing import List, Dict, Any
 from uuid import uuid4
 
 import aiohttp
@@ -35,6 +37,7 @@ class StressTester:
         productid: str = None,
         emqx: bool = False,
         sk: str = None,
+        threads: int = 1,  # 新增：线程数，默认为 1（单线程模式）
     ):
         self.url = url
         self.csv_file = csv_file
@@ -47,6 +50,7 @@ class StressTester:
         self.productid = productid
         self.emqx = emqx
         self.sk = sk
+        self.threads = threads  # 线程数
         self.device_ids: List[str] = []
         self.stats = {
             "total": 0,
@@ -57,8 +61,11 @@ class StressTester:
         }
         # 用于跟踪每个 deviceId 的上次请求时间（用于间隔控制）
         self.last_request_time = defaultdict(float)
-        self.interval_lock = asyncio.Lock()
-        self.stats_lock = asyncio.Lock()  # 用于保护统计数据的并发访问
+        self.interval_lock = asyncio.Lock()  # 单线程模式使用
+        self.stats_lock = asyncio.Lock()  # 用于保护统计数据的并发访问（单线程模式）
+        # 多线程模式下的线程安全锁
+        self.thread_stats_lock = threading.Lock()  # 用于多线程模式下的统计保护
+        self.thread_interval_lock = threading.Lock()  # 用于多线程模式下的间隔控制
 
     def load_device_ids(self) -> None:
         """从 CSV 文件加载 deviceId 列表"""
@@ -262,15 +269,26 @@ class StressTester:
 
             queue.task_done()
 
-    async def run(self) -> None:
-        """运行压力测试"""
+    def _update_stats_thread_safe(self, result: Dict[str, Any]) -> None:
+        """线程安全的统计更新（用于多线程模式）"""
+        with self.thread_stats_lock:
+            self.stats["total"] += 1
+            self.stats["latencies"].append(result["elapsed"])
+            if result["success"]:
+                self.stats["success"] += 1
+            else:
+                self.stats["failed"] += 1
+                self.stats["errors"].append(result)
+
+    async def _run_single_threaded(self) -> None:
+        """单线程模式运行（原有逻辑）"""
         # 加载 deviceId
         self.load_device_ids()
 
         # 计算总请求数：每个 deviceId 发送 loop_count 次
         total_requests = len(self.device_ids) * self.loop_count
 
-        print(f"\n开始压力测试:")
+        print(f"\n开始压力测试 (单线程模式):")
         print(f"  模式: {'EMQX' if self.emqx else '标准'}")
         print(f"  URL: {self.url}")
         print(f"  并发数: {self.concurrent}")
@@ -284,32 +302,222 @@ class StressTester:
         # 创建请求队列
         queue = asyncio.Queue(maxsize=self.concurrent * 2)
 
-        # 创建 HTTP 会话
-        connector = aiohttp.TCPConnector(limit=self.concurrent)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            # 启动工作协程
+        # 创建 HTTP 会话和连接池
+        connector = aiohttp.TCPConnector(
+            limit=max(100, self.concurrent * 2),
+            limit_per_host=self.concurrent,
+            ttl_dns_cache=300,
+            force_close=False,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True,
+        )
+        timeout = aiohttp.ClientTimeout(
+            total=self.timeout,
+            connect=5,
+            sock_read=10,
+        )
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            read_bufsize=65536,
+        ) as session:
             workers = [
                 asyncio.create_task(self.worker(session, queue))
                 for _ in range(self.concurrent)
             ]
 
-            # 发送请求：先发送所有设备的第一条消息，然后是第二条，以此类推
-            # 这样可以确保所有设备几乎同时收到相同轮次的消息
             start_time = time.time()
             for loop_index in range(self.loop_count):
                 for device_id in self.device_ids:
                     await queue.put((device_id, loop_index))
 
-            # 等待所有任务完成
             await queue.join()
 
-            # 停止工作协程
             for _ in range(self.concurrent):
                 await queue.put(None)
             await asyncio.gather(*workers)
 
             elapsed_time = time.time() - start_time
 
+        self.print_stats(elapsed_time)
+
+    def _thread_worker(self, task_queue: Queue, thread_id: int) -> None:
+        """线程工作函数：每个线程运行自己的事件循环"""
+        # 为每个线程创建独立的事件循环
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            loop.run_until_complete(self._thread_async_worker(task_queue, thread_id))
+        finally:
+            loop.close()
+
+    async def _thread_async_worker(self, task_queue: Queue, thread_id: int) -> None:
+        """线程内的异步工作函数"""
+        # 每个线程创建自己的连接池和会话
+        connector = aiohttp.TCPConnector(
+            limit=max(100, self.concurrent * 2),
+            limit_per_host=self.concurrent,
+            ttl_dns_cache=300,
+            force_close=False,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True,
+        )
+        timeout = aiohttp.ClientTimeout(
+            total=self.timeout,
+            connect=5,
+            sock_read=10,
+        )
+        
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            read_bufsize=65536,
+        ) as session:
+            # 创建该线程的异步队列
+            async_queue = asyncio.Queue(maxsize=self.concurrent * 2)
+            
+            # 启动工作协程
+            workers = [
+                asyncio.create_task(self._thread_worker_coroutine(session, async_queue, thread_id))
+                for _ in range(self.concurrent)
+            ]
+            
+            # 从线程队列获取任务并放入异步队列
+            async def task_loader():
+                task_count = 0
+                while True:
+                    try:
+                        # 非阻塞获取任务
+                        item = task_queue.get_nowait()
+                        if item is None:  # 结束信号
+                            break
+                        await async_queue.put(item)
+                        task_count += 1
+                    except Exception:
+                        # 队列为空（Empty 异常），等待一小段时间
+                        await asyncio.sleep(0.01)
+                        # 如果队列为空且异步队列也为空，则退出
+                        if task_queue.empty() and async_queue.empty():
+                            # 再等待一下，确保没有新任务
+                            await asyncio.sleep(0.1)
+                            if task_queue.empty():
+                                break
+                
+                # 发送停止信号给工作协程
+                for _ in range(self.concurrent):
+                    await async_queue.put(None)
+            
+            loader_task = asyncio.create_task(task_loader())
+            
+            # 等待所有协程和加载器完成
+            await asyncio.gather(*workers, loader_task, return_exceptions=True)
+
+    async def _thread_worker_coroutine(
+        self, session: aiohttp.ClientSession, queue: asyncio.Queue, thread_id: int
+    ) -> None:
+        """线程内的工作协程"""
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            
+            if item is None:  # 结束信号
+                break
+
+            device_id, loop_index = item
+
+            # 间隔控制（多线程模式使用线程锁）
+            if self.interval > 0 and loop_index > 0:
+                with self.thread_interval_lock:
+                    last_time = self.last_request_time[device_id]
+                    current_time = time.time()
+                    elapsed = current_time - last_time
+                    if elapsed < self.interval:
+                        sleep_time = self.interval - elapsed
+                    else:
+                        sleep_time = 0
+                
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+
+            result = await self.send_request(session, device_id, loop_index)
+            
+            # 更新上次请求时间（多线程模式使用线程锁）
+            with self.thread_interval_lock:
+                self.last_request_time[device_id] = time.time()
+            
+            # 线程安全的统计更新
+            self._update_stats_thread_safe(result)
+
+            queue.task_done()
+
+    async def run(self) -> None:
+        """运行压力测试"""
+        if self.threads == 1:
+            # 单线程模式（原有逻辑）
+            await self._run_single_threaded()
+        else:
+            # 多线程模式
+            await self._run_multi_threaded()
+
+    async def _run_multi_threaded(self) -> None:
+        """多线程模式运行"""
+        # 加载 deviceId
+        self.load_device_ids()
+
+        # 计算总请求数
+        total_requests = len(self.device_ids) * self.loop_count
+
+        print(f"\n开始压力测试 (多线程模式):")
+        print(f"  模式: {'EMQX' if self.emqx else '标准'}")
+        print(f"  URL: {self.url}")
+        print(f"  线程数: {self.threads}")
+        print(f"  每线程并发数: {self.concurrent}")
+        print(f"  总并发数: {self.threads * self.concurrent}")
+        print(f"  DeviceId 数量: {len(self.device_ids)}")
+        print(f"  每个 DeviceId 循环次数: {self.loop_count}")
+        print(f"  总请求数: {total_requests}")
+        print(f"  每个线程的连接池: {self.concurrent} 个连接/主机")
+        print(f"  总连接池数: {self.threads} 个（每个线程一个）")
+        print(f"  总连接数限制: {self.threads * self.concurrent} 个连接/主机")
+        if self.interval > 0:
+            print(f"  请求间隔: {self.interval * 1000:.0f}ms")
+        print(f"  超时时间: {self.timeout}秒\n")
+
+        # 创建任务队列（线程安全的 Queue）
+        task_queue = Queue()
+        
+        # 准备所有任务
+        tasks = []
+        for loop_index in range(self.loop_count):
+            for device_id in self.device_ids:
+                tasks.append((device_id, loop_index))
+        
+        # 将任务放入队列
+        for task in tasks:
+            task_queue.put(task)
+        
+        # 创建并启动线程
+        threads = []
+        start_time = time.time()
+        
+        for thread_id in range(self.threads):
+            thread = threading.Thread(
+                target=self._thread_worker,
+                args=(task_queue, thread_id),
+                name=f"WorkerThread-{thread_id}"
+            )
+            thread.start()
+            threads.append(thread)
+        
+        # 等待所有线程完成
+        for thread in threads:
+            thread.join()
+        
+        elapsed_time = time.time() - start_time
+        
         # 打印统计信息
         self.print_stats(elapsed_time)
 
@@ -378,7 +586,14 @@ def main():
         "--concurrent",
         type=int,
         default=10,
-        help="并发数 (默认: 10)",
+        help="每线程并发数（协程数）(默认: 10)",
+    )
+    parser.add_argument(
+        "-T",
+        "--threads",
+        type=int,
+        default=1,
+        help="线程数，用于充分利用多核 CPU (默认: 1，单线程模式)",
     )
     parser.add_argument(
         "-c",
@@ -458,6 +673,7 @@ def main():
         productid=args.productid,
         emqx=args.emqx,
         sk=args.sk,
+        threads=args.threads,
     )
 
     try:
