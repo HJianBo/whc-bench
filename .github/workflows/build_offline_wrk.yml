@@ -28,28 +28,75 @@ jobs:
       run: |
         # 安装 EPEL 仓库配置包
         dnf install -y epel-release 
+        # 清理并重建 dnf 缓存
+        dnf clean all
+        dnf makecache
         # 安装 tar 和 gzip 工具，用于后续打包
-        dnf install -y tar gzip
+        dnf install -y tar gzip git make gcc openssl-devel
 
-    - name: 📦 Download wrk and its Dependencies
+    - name: 📦 Download Build Dependencies for wrk
       shell: bash
       run: |
-        echo "Starting download of wrk and all dependencies for offline installation..."
-        # 使用 dnf download --resolve 下载 wrk 及其所有依赖到当前目录
-        dnf download --resolve wrk
+        echo "Starting download of build dependencies for wrk..."
+        # 创建目录存放RPM文件
+        mkdir -p wrk_offline_el8
+        
+        # 下载编译 wrk 所需的依赖包
+        # wrk 需要: gcc, make, openssl-devel, git (用于下载源码)
+        dnf download --resolve --destdir wrk_offline_el8/ gcc make openssl-devel git tar gzip
         
         # 检查是否下载成功
         if [ $? -ne 0 ]; then
-          echo "ERROR: Failed to download wrk or its dependencies."
+          echo "ERROR: Failed to download build dependencies."
           exit 1
         fi
         
-        # 创建一个目录来存放RPM文件，方便后续打包
-        mkdir wrk_offline_el8
-        mv *.rpm wrk_offline_el8/
-        
-        echo "Downloaded files:"
+        echo "Downloaded dependency packages:"
         ls -l wrk_offline_el8/
+
+    - name: 🔨 Build wrk from Source
+      shell: bash
+      run: |
+        echo "Building wrk from source..."
+        # 克隆 wrk 源码
+        git clone https://github.com/wg/wrk.git
+        cd wrk
+        # 编译 wrk
+        make
+        # 检查编译是否成功
+        if [ ! -f wrk ]; then
+          echo "ERROR: Failed to build wrk."
+          exit 1
+        fi
+        # 复制编译好的二进制文件到离线包目录
+        mkdir -p ../wrk_offline_el8/bin
+        cp wrk ../wrk_offline_el8/bin/
+        cd ..
+        
+        echo "wrk binary built successfully:"
+        ls -lh wrk_offline_el8/bin/wrk
+
+    - name: 📝 Create Installation README
+      shell: bash
+      run: |
+        cat > wrk_offline_el8/README.txt << 'EOF'
+wrk 离线安装包 - EL8 (CentOS/Rocky 8)
+
+安装步骤：
+1. 安装依赖包：
+   sudo dnf install -y *.rpm
+
+2. 安装 wrk 二进制文件：
+   sudo cp bin/wrk /usr/local/bin/
+   sudo chmod +x /usr/local/bin/wrk
+
+3. 验证安装：
+   wrk --version
+
+注意：此离线包包含编译好的 wrk 二进制文件和所有构建依赖的 RPM 包。
+EOF
+        echo "Created README.txt:"
+        cat wrk_offline_el8/README.txt
 
     - name: 🎯 Create Offline Installation Archive
       shell: bash
@@ -75,5 +122,10 @@ jobs:
         echo "--------------------------------------------------------"
         echo "离线安装包已成功构建并上传为 Artifact："
         echo "${{ steps.archive.outputs.archive_name }}"
-        echo "您可以在 Actions 页面下载此文件，并在离线环境中使用 'sudo dnf install *.rpm' 进行安装。"
+        echo ""
+        echo "安装说明："
+        echo "1. 解压离线包: tar -xzf ${{ steps.archive.outputs.archive_name }}"
+        echo "2. 安装依赖: cd wrk_offline_el8 && sudo dnf install -y *.rpm"
+        echo "3. 安装 wrk: sudo cp bin/wrk /usr/local/bin/ && sudo chmod +x /usr/local/bin/wrk"
+        echo "4. 验证安装: wrk --version"
         echo "--------------------------------------------------------"
