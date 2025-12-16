@@ -1,7 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec 文件
 # 注意：这个文件用于打包 http_stress.py
-# 要打包 mqtt_client.py，请使用 build_mqtt.spec 或直接使用命令行
 
 block_cipher = None
 
