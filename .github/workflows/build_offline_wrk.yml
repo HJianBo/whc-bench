@@ -1,0 +1,79 @@
+name: Build wrk Offline Installer for EL8 (CentOS/Rocky 8)
+
+on:
+  # 手动触发 workflow，方便构建离线包
+  workflow_dispatch: {}
+  # 或者在每次新的 Tag 发布时触发
+  # push:
+  #   tags:
+  #     - 'v*'
+
+jobs:
+  build_offline_package:
+    # 使用通用的 Ubuntu runner 并通过 Docker 容器来模拟 CentOS 8 环境
+    runs-on: ubuntu-latest
+
+    container:
+      # 使用 CentOS 8 的稳定替代品 Rocky Linux 8 作为构建环境
+      image: rockylinux:8
+      options: --user root # 确保有 root 权限执行安装和打包操作
+
+    steps:
+    - name: ⬇️ Checkout repository (If needed, for versioning/context)
+      # 如果你的项目需要上下文，就保留这一步
+      uses: actions/checkout@v4
+
+    - name: 🔄 Install EPEL Repository and Utilities
+      shell: bash
+      run: |
+        # 安装 EPEL 仓库配置包
+        dnf install -y epel-release 
+        # 安装 tar 和 gzip 工具，用于后续打包
+        dnf install -y tar gzip
+
+    - name: 📦 Download wrk and its Dependencies
+      shell: bash
+      run: |
+        echo "Starting download of wrk and all dependencies for offline installation..."
+        # 使用 dnf download --resolve 下载 wrk 及其所有依赖到当前目录
+        dnf download --resolve wrk
+        
+        # 检查是否下载成功
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Failed to download wrk or its dependencies."
+          exit 1
+        fi
+        
+        # 创建一个目录来存放RPM文件，方便后续打包
+        mkdir wrk_offline_el8
+        mv *.rpm wrk_offline_el8/
+        
+        echo "Downloaded files:"
+        ls -l wrk_offline_el8/
+
+    - name: 🎯 Create Offline Installation Archive
+      shell: bash
+      run: |
+        ARCHIVE_NAME="wrk-4.2.0-el8-offline-$(date +%Y%m%d).tar.gz"
+        
+        # 切换到父目录打包
+        tar -czvf ${ARCHIVE_NAME} wrk_offline_el8
+        
+        echo "::set-output name=archive_name::${ARCHIVE_NAME}"
+      id: archive
+
+    - name: ⬆️ Upload Offline Package as Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        # 使用上一步生成的档案名称
+        name: ${{ steps.archive.outputs.archive_name }}
+        path: ${{ steps.archive.outputs.archive_name }}
+        retention-days: 7 # 产物保留 7 天
+        
+    - name: 🎉 Print Success Message
+      run: |
+        echo "--------------------------------------------------------"
+        echo "离线安装包已成功构建并上传为 Artifact："
+        echo "${{ steps.archive.outputs.archive_name }}"
+        echo "您可以在 Actions 页面下载此文件，并在离线环境中使用 'sudo dnf install *.rpm' 进行安装。"
+        echo "--------------------------------------------------------"
