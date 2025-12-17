@@ -7,7 +7,7 @@ local device_ids = {}
 -- CSV 文件路径（可通过命令行参数传入）
 local csv_file = "devices.csv"
 
--- 产品 ID（可选，将从 CSV 文件读取或使用默认值）
+-- 产品 ID（可选，通过全局变量指定，可在脚本生成时设置）
 local product_id = nil
 
 -- 每个设备的请求计数器（用于 mid）
@@ -32,7 +32,6 @@ local function load_device_ids_from_csv(file_path)
     
     local is_first_line = true
     local device_id_column = nil
-    local product_id_column = nil
     
     for line in file:lines() do
         -- 跳过空行
@@ -46,14 +45,12 @@ local function load_device_ids_from_csv(file_path)
             end
             
             if is_first_line then
-                -- 第一行是表头，查找 deviceId 和 productId 列
+                -- 第一行是表头，查找 deviceId 列
                 is_first_line = false
                 for i, header in ipairs(fields) do
-                    local header_lower = string.lower(header)
-                    if header_lower == "deviceid" then
+                    if string.lower(header) == "deviceid" then
                         device_id_column = i
-                    elseif header_lower == "productid" then
-                        product_id_column = i
+                        break
                     end
                 end
                 -- 如果没有找到 deviceId 列，使用第一列
@@ -61,13 +58,9 @@ local function load_device_ids_from_csv(file_path)
                     device_id_column = 1
                 end
             else
-                -- 数据行，提取 device ID 和 product ID
+                -- 数据行，提取 device ID
                 if fields[device_id_column] and fields[device_id_column] ~= "" then
                     table.insert(ids, fields[device_id_column])
-                    -- 如果找到 productId 列且 product_id 还未设置，使用第一行的值
-                    if product_id_column and not product_id and fields[product_id_column] and fields[product_id_column] ~= "" then
-                        product_id = fields[product_id_column]
-                    end
                 end
             end
         end
