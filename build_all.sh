@@ -13,10 +13,6 @@ if ! command -v pyinstaller &> /dev/null; then
     exit 1
 fi
 
-# 打包 http_stress.py
-echo "正在打包 http_stress.py..."
-pyinstaller --onefile --name http_stress http_stress.py
-
 # 打包 kafka_consumer.py
 echo "正在打包 kafka_consumer.py..."
 pyinstaller --onefile --name kafka_consumer \
@@ -35,6 +31,5 @@ ls -lh dist/
 
 echo ""
 echo "使用方法:"
-echo "  ./dist/http_stress --url <URL> --csv devices.csv"
 echo "  ./dist/kafka_consumer --topic <TOPIC> --group-id <GROUP_ID>"
 

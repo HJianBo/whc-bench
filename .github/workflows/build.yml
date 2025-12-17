@@ -1,10 +1,6 @@
 name: Build Executables on CentOS 8
 
 on:
-  push:
-    branches:
-      - master
-      - main
   workflow_dispatch:
 
 jobs:
@@ -54,11 +50,6 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           uv sync --group dev
 
-      - name: Build http_stress
-        run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
-          uv run pyinstaller http_stress.spec
-
       - name: Build kafka_consumer
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
@@ -69,7 +60,6 @@ jobs:
         with:
           name: executables-centos8
           path: |
-            dist/http_stress
             dist/kafka_consumer
           retention-days: 30
 
