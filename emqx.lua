@@ -10,9 +10,6 @@ local csv_file = "devices.csv"
 -- 每个设备的请求计数器（用于 mid）
 local device_counters = {}
 
--- 当前设备索引（用于按顺序轮流选择设备）
-local current_device_index = 1
-
 -- 打印响应结果开关（默认为打开）
 print_responses = false
 -- 打印响应计数器（用于限制打印数量，避免输出过多）
@@ -89,8 +86,8 @@ function init(args)
         device_counters[device_id] = 0
     end
     
-    -- 初始化当前设备索引
-    current_device_index = 1
+    -- 初始化随机数种子
+    math.randomseed(os.time())
 end
 
 -- 生成 UUID v4（32 位十六进制字符串，无连字符）
@@ -197,12 +194,9 @@ function request()
         error("device_ids 列表为空，请先使用 generate_wrk_script.py 生成脚本")
     end
     
-    -- 按顺序轮流选择一个设备 ID
-    local device_id = device_ids[current_device_index]
-    current_device_index = current_device_index + 1
-    if current_device_index > #device_ids then
-        current_device_index = 1
-    end
+    -- 随机选择一个设备 ID
+    local random_index = math.random(1, #device_ids)
+    local device_id = device_ids[random_index]
     
     -- 初始化计数器（如果不存在）
     if device_counters[device_id] == nil then

@@ -8,19 +8,25 @@ local device_ids = {}
 local csv_file = "devices.csv"
 
 -- 产品 ID（可选，通过全局变量指定，可在脚本生成时设置）
-local product_id = nil
+local product_id = "57b0817bf15132759bccbefbdb38bf23"
 
 -- 每个设备的请求计数器（用于 mid）
 local device_counters = {}
 
--- 当前设备索引（用于按顺序轮流选择设备）
-local current_device_index = 1
+-- 当前设备索引（已废弃，改为随机选择）
+-- local current_device_index = 1
 
 -- 打印响应结果开关（默认为关闭）
 print_responses = false
 -- 打印响应计数器（用于限制打印数量，避免输出过多）
 print_response_count = 0
 max_print_responses = 100  -- 最多打印的响应数量（0 表示不限制）
+
+-- 统计变量（每个线程独立）
+success_count = 0
+http_error_count = 0
+business_error_count = 0
+parse_error_count = 0
 
 -- 从 CSV 文件读取 device IDs
 local function load_device_ids_from_csv(file_path)
@@ -70,7 +76,7 @@ local function load_device_ids_from_csv(file_path)
     return ids
 end
 
--- 初始化函数：在脚本加载时执行一次
+-- 初始化函数：在每个线程启动时执行
 function init(args)
     -- 尝试从命令行参数获取 CSV 文件路径
     if args and #args > 0 then
@@ -96,8 +102,11 @@ function init(args)
         device_counters[device_id] = 0
     end
     
-    -- 初始化当前设备索引
-    current_device_index = 1
+    -- 初始化统计计数器
+    success_count = 0
+    http_error_count = 0
+    business_error_count = 0
+    parse_error_count = 0
 end
 
 -- 生成 UUID v4（32 位十六进制字符串，无连字符）
@@ -204,12 +213,9 @@ function request()
         error("device_ids 列表为空，请先使用 generate_wrk_script.py 生成脚本")
     end
     
-    -- 按顺序轮流选择一个设备 ID
-    local device_id = device_ids[current_device_index]
-    current_device_index = current_device_index + 1
-    if current_device_index > #device_ids then
-        current_device_index = 1
-    end
+    -- 随机选择一个设备 ID
+    local random_index = math.random(1, #device_ids)
+    local device_id = device_ids[random_index]
     
     -- 初始化计数器（如果不存在）
     if device_counters[device_id] == nil then
@@ -230,7 +236,7 @@ function request()
         cmd = "bench",
         deviceId = device_id,
         eventTime = event_time,
-        expire = 5,
+        expire = 1,
         mid = mid,
         msgId = msg_id,
         paras = {
@@ -245,7 +251,7 @@ function request()
         commandType = 1,
         deviceId = device_id,
         gatewayId = device_id,
-        expire = 5,
+        expire = 1,
         qos = 1
     }
     
@@ -257,6 +263,50 @@ function request()
     
     -- 返回请求
     return wrk.format("POST", nil, nil, json_encode(payload))
+end
+
+
+-- JSON 解码函数（简化版，用于解析 JSON 字符串）
+-- 仅用于提取响应体中的 code、success、message 等字段
+function json_decode(str)
+    if not str or str == "" then
+        return nil
+    end
+    
+    -- 移除首尾空白
+    str = string.match(str, "^%s*(.-)%s*$")
+    
+    -- 检查是否是 JSON 对象
+    if not (string.sub(str, 1, 1) == "{" and string.sub(str, -1, -1) == "}") then
+        return nil
+    end
+    
+    local obj = {}
+    
+    -- 提取 "code": 数字
+    local code = string.match(str, '"code"%s*:%s*(%d+)')
+    if code then
+        obj.code = tonumber(code)
+    end
+    
+    -- 提取 "success": true/false
+    local success = string.match(str, '"success"%s*:%s*(true)')
+    if success then
+        obj.success = true
+    else
+        local success_false = string.match(str, '"success"%s*:%s*(false)')
+        if success_false then
+            obj.success = false
+        end
+    end
+    
+    -- 提取 "message": "..."
+    local message = string.match(str, '"message"%s*:%s*"([^"]*)"')
+    if message then
+        obj.message = message
+    end
+    
+    return obj
 end
 
 -- JSON 编码函数（简化版，用于生成 JSON 字符串）
@@ -318,37 +368,148 @@ end
 
 -- 响应处理函数：处理每个响应
 function response(status, headers, body)
-    -- 确保 print_responses 开关已初始化
-    if print_responses == nil then
-        print_responses = false
-    end
-    if print_response_count == nil then
-        print_response_count = 0
-    end
-    if max_print_responses == nil then
-        max_print_responses = 100
+    -- 判断是否成功
+    local is_success = false
+    local error_type = ""
+    local error_message = ""
+    
+    -- 首先检查 HTTP 状态码
+    if status < 200 or status >= 400 then
+        -- HTTP 错误
+        http_error_count = http_error_count + 1
+        error_type = "HTTP错误"
+        error_message = string.format("status=%d", status)
+        is_success = false
+    else
+        -- HTTP 状态码正常，检查响应体中的业务错误
+        if body and body ~= "" then
+            -- 尝试解析 JSON
+            local parsed = json_decode(body)
+            if parsed then
+                -- 检查 code 字段
+                if parsed.code and tonumber(parsed.code) ~= 0 then
+                    -- 业务错误：code 非 0
+                    business_error_count = business_error_count + 1
+                    error_type = "业务错误"
+                    error_message = string.format("code=%s", tostring(parsed.code))
+                    if parsed.message then
+                        error_message = error_message .. string.format(", message: %s", parsed.message)
+                    end
+                    is_success = false
+                elseif parsed.success == false then
+                    -- 业务错误：success 为 false
+                    business_error_count = business_error_count + 1
+                    error_type = "业务错误"
+                    error_message = "success=false"
+                    if parsed.code then
+                        error_message = string.format("code=%s, ", tostring(parsed.code)) .. error_message
+                    end
+                    if parsed.message then
+                        error_message = error_message .. string.format(", message: %s", parsed.message)
+                    end
+                    is_success = false
+                else
+                    -- 业务成功
+                    success_count = success_count + 1
+                    is_success = true
+                end
+            else
+                -- JSON 解析失败
+                parse_error_count = parse_error_count + 1
+                error_type = "解析错误"
+                error_message = "invalid_json"
+                is_success = false
+            end
+        else
+            -- 没有响应体，但 HTTP 状态码正常，视为成功
+            success_count = success_count + 1
+            is_success = true
+        end
     end
     
-    -- 如果开关打开，打印响应结果
+    -- 为失败请求输出简单标记（用于统计）
+    if not is_success then
+        io.write(string.format("[FAIL:%s]\n", error_type))
+    end
+    
+    -- 如果开关打开，打印详细响应信息
     if print_responses ~= false then
+        -- 确保计数器已初始化
+        if print_response_count == nil then
+            print_response_count = 0
+        end
+        if max_print_responses == nil then
+            max_print_responses = 100
+        end
+        
         -- 检查是否超过最大打印数量（0 表示不限制）
         if max_print_responses == 0 or print_response_count < max_print_responses then
             print_response_count = print_response_count + 1
-            local status_icon = (status >= 200 and status < 400) and "✓" or "✗"
-            local status_label = (status >= 200 and status < 400) and "成功" or "失败"
+            local status_icon = is_success and "✓" or "✗"
+            local status_label = is_success and "成功" or "失败"
+            
             io.write(string.format("[响应 %d] %s 状态码: %d (%s)\n", print_response_count, status_icon, status, status_label))
+            
+            if not is_success then
+                io.write(string.format("错误类型: %s\n", error_type))
+                io.write(string.format("错误信息: %s\n", error_message))
+            end
+            
             if body and body ~= "" then
                 io.write("响应体: " .. body .. "\n")
             else
                 io.write("响应体: (无响应体)\n")
             end
+            
+            -- 显示当前线程统计
+            local total = success_count + http_error_count + business_error_count + parse_error_count
+            io.write(string.format("[线程统计] 总数=%d (成功=%d, HTTP错误=%d, 业务错误=%d, 解析错误=%d)\n",
+                total, success_count, http_error_count, business_error_count, parse_error_count))
+            
             io.write("-" .. string.rep("-", 70) .. "\n")
         end
     end
 end
 
--- 测试结束函数（已简化，不打印统计信息）
+-- 测试结束函数
 function done(summary, latency, requests)
-    -- 不打印任何统计信息，响应已在 response() 函数中实时打印
+    io.write("\n"..string.rep("=", 80).."\n")
+    io.write("测试统计摘要\n")
+    io.write(string.rep("=", 80).."\n\n")
+    
+    -- HTTP 层统计
+    io.write("HTTP 层统计:\n")
+    io.write(string.format("  总请求数: %d\n", summary.requests))
+    io.write(string.format("  总时长: %.2f 秒\n", summary.duration / 1000000))
+    io.write(string.format("  平均 QPS: %.2f req/s\n", summary.requests / (summary.duration / 1000000)))
+    io.write(string.format("  平均延迟: %.2f ms\n", latency.mean / 1000))
+    io.write(string.format("  最大延迟: %.2f ms\n", latency.max / 1000))
+    
+    io.write("\n"..string.rep("-", 80).."\n")
+    io.write("业务层统计 (基于响应内容分析):\n")
+    io.write(string.rep("-", 80).."\n\n")
+    
+    io.write("上方输出中每个失败请求都有一行 [FAIL:错误类型] 标记\n\n")
+    
+    io.write("统计命令示例 (将输出保存到文件后使用):\n")
+    io.write("  # 保存输出: wrk ... 2>&1 | tee output.log\n\n")
+    io.write("  总失败数:       grep -c '\\[FAIL:' output.log\n")
+    io.write("  HTTP错误数:     grep -c '\\[FAIL:HTTP错误\\]' output.log\n")
+    io.write("  业务错误数:     grep -c '\\[FAIL:业务错误\\]' output.log\n")
+    io.write("  解析错误数:     grep -c '\\[FAIL:解析错误\\]' output.log\n\n")
+    
+    io.write("计算成功率:\n")
+    io.write(string.format("  总请求数 = %d\n", summary.requests))
+    io.write("  失败数 = grep -c '\\[FAIL:' output.log\n")
+    io.write("  成功数 = 总请求数 - 失败数\n")
+    io.write("  成功率 = 成功数 / 总请求数 * 100%\n\n")
+    
+    io.write("一键计算成功率脚本:\n")
+    io.write("  TOTAL="..tostring(summary.requests).."; ")
+    io.write("FAIL=$(grep -c '\\[FAIL:' output.log 2>/dev/null || echo 0); ")
+    io.write("SUCCESS=$((TOTAL - FAIL)); ")
+    io.write("echo \"成功: $SUCCESS/$TOTAL ($(awk \"BEGIN{printf \\\"%.2f\\\", $SUCCESS/$TOTAL*100}\")%)\"\n")
+    
+    io.write("\n"..string.rep("=", 80).."\n\n")
 end
 
